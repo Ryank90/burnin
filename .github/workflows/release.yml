@@ -1,0 +1,114 @@
+name: Release
+
+# Builds Linux binaries for x86_64 and aarch64 and, for a version tag,
+# publishes them as a GitHub release. Pull requests that change the build
+# run everything except the publish step.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Oldest glibc the Linux binaries run on. Everything CUDA-related is loaded
+  # at runtime, so glibc is the binaries' only system dependency.
+  GLIBC: "2.28"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Check the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "v$version" = "$GITHUB_REF_NAME"
+      - name: Build
+        run: cargo zigbuild --release --locked --target "${{ matrix.target }}.$GLIBC"
+      - name: Package
+        run: |
+          name="burnin-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/burnin" README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  smoke:
+    name: smoke (${{ matrix.target }})
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist
+      - name: Check the archive and binary
+        working-directory: dist
+        run: |
+          sha256sum -c "burnin-${{ matrix.target }}.tar.gz.sha256"
+          tar -xzf "burnin-${{ matrix.target }}.tar.gz"
+          bin="burnin-${{ matrix.target }}/burnin"
+          "$bin" --version
+
+          # The runners have no NVIDIA driver, so this must fail cleanly with exit status 2.
+          status=0
+          "$bin" list || status=$?
+          test "$status" -eq 2
+
+          # The binary must not need a newer glibc than advertised.
+          newest=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "newest glibc symbol: $newest"
+          test "$(printf '%s\n' "GLIBC_$GLIBC" "$newest" | sort -V | tail -1)" = "GLIBC_$GLIBC"
+
+  publish:
+    needs: smoke
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
+          --verify-tag

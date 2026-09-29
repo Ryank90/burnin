@@ -30,6 +30,18 @@ Every GPU is tested at the same time, each by its own worker thread. A superviso
 
 The build itself doesn't need the CUDA toolkit: burnin loads the CUDA libraries when it starts.
 
+## Install
+
+Prebuilt Linux binaries for x86_64 and aarch64 are attached to each [GitHub release](https://github.com/Ryank90/burnin/releases). They run on any distribution with glibc 2.28 or newer.
+
+```sh
+target="$(uname -m)-unknown-linux-gnu"
+curl -fsSL "https://github.com/Ryank90/burnin/releases/latest/download/burnin-$target.tar.gz" | tar -xz
+./burnin-$target/burnin --version
+```
+
+Each archive has a matching `.sha256` file for checking the download.
+
 ## Build
 
 ```sh
@@ -67,7 +79,6 @@ On GPUs that share system RAM with the CPU, such as the GB10 in DGX Spark, CUDA'
 - More precisions: TF32, FP16, BF16 and FP8.
 - Telemetry in the summary, plus ECC error counts and driver error events. Progress lines already show temperature, power, clock and throttling.
 - JSON output for automation.
-- Prebuilt x86_64 and aarch64 release binaries.
 - An Apple Silicon backend using Metal.
 
 ## Contributing
@@ -82,6 +93,8 @@ cargo check --target aarch64-unknown-linux-gnu
 ```
 
 GPU runs need a Linux machine with an NVIDIA GPU. When you report a problem, please include the output of `burnin probe`.
+
+To publish a release, set the new version in `Cargo.toml`, merge it, then push a matching tag such as `v0.2.0`. The release workflow builds and checks both Linux binaries, then publishes them to a GitHub release with generated notes.
 
 ## License
 
