@@ -2,7 +2,7 @@
 
 GPU burn-in and stress testing. burnin keeps every GPU in a machine busy with large matrix multiplies and checks that every result is correct, so you can find faulty hardware before it goes into service.
 
-> **Status: early prototype.** It tests NVIDIA GPUs on Linux. See the [roadmap](#roadmap) for what's coming.
+> **Status: early prototype.** It tests NVIDIA GPUs on Linux and Apple GPUs on macOS. See the [roadmap](#roadmap) for what's coming.
 
 ## How it works
 
@@ -28,11 +28,17 @@ Progress lines show each GPU's temperature, power, SM clock and any throttling. 
 
 ## Requirements
 
+On Linux:
+
 - Linux on x86_64 or aarch64.
 - An NVIDIA GPU and driver.
 - The CUDA 13 libraries cuBLAS and NVRTC, plus cuBLASLt for `fp8`. CUDA 12 may work but hasn't been tested yet.
 
 The build itself doesn't need the CUDA toolkit: burnin loads the CUDA libraries when it starts.
+
+On macOS:
+
+- A Mac with Apple silicon. Metal and Metal Performance Shaders come with macOS, so nothing else needs installing.
 
 ## Install
 
@@ -109,17 +115,27 @@ burnin run 10m --format json | tail -n 1 | jq '.gpus[] | {gpu, verdict, detail}'
 
 Errors that stop burnin before testing starts still go to stderr as text, with exit status 2.
 
+### Apple GPUs
+
+On a Mac, burnin tests the GPU with Metal:
+
+- Only `fp32` is supported, since Apple GPUs have no fp64.
+- `--matrix-size` must be a multiple of 64. Metal Performance Shaders can leave part of a result unwritten for other sizes, which would look like a hardware fault.
+- A run takes 50% of the usable memory by default rather than 90%, since a Mac is often a laptop in use while it's tested. Usable memory is the GPU's recommended working set, but no more than the system's available memory less a reserve for the OS. Pass `-m 90%` on an idle machine to test more memory.
+- Each matrix multiply is split into command buffers of a few milliseconds. macOS stops GPU work that holds up the display for too long, and short command buffers keep the desktop responsive.
+- Progress lines have no temperature, power or clock readings yet.
+
 ### Unified-memory GPUs
 
 On GPUs that share system RAM with the CPU, such as the GB10 in DGX Spark, CUDA's figure for free memory leaves out reclaimable page cache. burnin sizes its memory from the system's available memory instead, and leaves a reserve for the OS. If several such GPUs are tested at once, they split that memory between them. `burnin probe` shows both figures and the budget it would use.
 
 ## Roadmap
 
-- An Apple Silicon backend using Metal.
+- Apple GPU telemetry.
 
 ## Contributing
 
-Development works on any platform. The CUDA backend is Linux-only, but it can be type-checked from elsewhere:
+Development works on any platform. The CUDA backend is Linux-only and the Metal backend is macOS-only, but the CUDA backend can be type-checked from elsewhere:
 
 ```sh
 cargo test
@@ -128,7 +144,7 @@ rustup target add aarch64-unknown-linux-gnu
 cargo check --target aarch64-unknown-linux-gnu
 ```
 
-GPU runs need a Linux machine with an NVIDIA GPU. When you report a problem, please include the output of `burnin probe`.
+`cargo test` doesn't use the GPU. GPU runs need a Linux machine with an NVIDIA GPU, or a Mac with Apple silicon. When you report a problem, please include the output of `burnin probe`.
 
 To publish a release, set the new version in `Cargo.toml`, merge it, then push a matching tag such as `v0.2.0`. The release workflow builds and checks both Linux binaries, then publishes them to a GitHub release with generated notes.
 

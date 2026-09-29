@@ -5,7 +5,7 @@ mod fp8;
 
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -313,7 +313,7 @@ pub fn run(args: &RunArgs) -> Result<u8> {
     let pci_bus_ids: Vec<String> = infos.iter().map(|info| info.pci_bus_id.clone()).collect();
 
     let stop = Arc::new(AtomicBool::new(false));
-    install_stop_handler(stop.clone())?;
+    supervisor::install_stop_handler(stop.clone())?;
 
     let mut out = Output::new(args.format, std::io::stdout().lock());
     out.emit(Record::Start {
@@ -377,19 +377,4 @@ pub fn serve_worker(args: &WorkerArgs) -> ExitCode {
             Err(err) => Box::new(move |_| Err(err)),
         }
     })
-}
-
-/// The first Ctrl-C (or SIGTERM) lets every GPU finish its current chunk and
-/// prints the summary; a second one exits immediately.
-fn install_stop_handler(stop: Arc<AtomicBool>) -> Result<()> {
-    let presses = AtomicUsize::new(0);
-    ctrlc::set_handler(move || {
-        if presses.fetch_add(1, Ordering::SeqCst) == 0 {
-            eprintln!("\nstopping after the current chunk; press Ctrl-C again to quit now");
-            stop.store(true, Ordering::SeqCst);
-        } else {
-            std::process::exit(130);
-        }
-    })
-    .context("could not install the Ctrl-C handler")
 }

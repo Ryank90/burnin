@@ -1,8 +1,8 @@
 //! burnin: GPU burn-in and stress testing.
 
-// The GPU backends are platform-specific; on other platforms much of the shared
-// code is unused.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// The GPU backends are platform-specific; on platforms without one much of the
+// shared code is unused.
+#![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 
 mod isolation;
 mod mem;
@@ -15,6 +15,9 @@ mod units;
 mod cuda;
 #[cfg(target_os = "linux")]
 mod telemetry;
+
+#[cfg(target_os = "macos")]
+mod metal;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -242,9 +245,22 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
+    match command {
+        Command::List => metal::list().map(|()| ExitCode::SUCCESS),
+        Command::Probe { device } => metal::probe(device).map(|()| ExitCode::SUCCESS),
+        Command::Run(args) => metal::run(&args).map(ExitCode::from),
+        Command::Worker(args) => Ok(metal::serve_worker(&args)),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn dispatch(_command: Command) -> anyhow::Result<ExitCode> {
-    anyhow::bail!("there is no GPU backend for this platform yet; the CUDA backend requires Linux")
+    anyhow::bail!(
+        "there is no GPU backend for this platform yet; burnin needs Linux with an NVIDIA GPU, \
+         or macOS with an Apple GPU"
+    )
 }
 
 #[cfg(test)]
