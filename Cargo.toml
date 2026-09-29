@@ -1,0 +1,23 @@
+[package]
+name = "burnin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "GPU burn-in and stress testing"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["gpu", "cuda", "stress-test", "burn-in", "hardware"]
+categories = ["command-line-utilities", "hardware-support"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = { version = "3.5.2", features = ["termination"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cudarc = { version = "=0.19.10", default-features = false, features = ["std", "driver", "cublas", "nvrtc", "dynamic-loading", "cuda-13000"] }
+nvml-wrapper = "0.13.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
