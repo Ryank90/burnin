@@ -4,6 +4,8 @@
 //! The supervisor knows nothing about CUDA. A worker is any closure that
 //! reports through a [`Reporter`] and returns once the shared stop flag is set,
 //! so scheduling, reporting and failure handling can be tested without a GPU.
+//! A worker thread may itself relay events from a child process; see
+//! [`crate::isolation`].
 
 use std::any::Any;
 use std::io::Write;
@@ -13,6 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::units::format_duration;
 
@@ -38,6 +42,7 @@ pub struct Target {
 pub type Work = Box<dyn FnOnce(&Reporter) -> anyhow::Result<()> + Send>;
 
 /// What a worker reports once it is set up and about to start testing.
+#[derive(Serialize, Deserialize)]
 pub struct Ready {
     /// One line describing the setup, such as memory used and chunk size.
     pub detail: String,
@@ -46,7 +51,10 @@ pub struct Ready {
     pub chunk_secs: f64,
 }
 
-enum Event {
+/// Something a worker reports. Serializable so that workers in child
+/// processes can send events over a pipe.
+#[derive(Serialize, Deserialize)]
+pub(crate) enum Event {
     Ready(Ready),
     Progress {
         pass: u64,
@@ -62,19 +70,44 @@ enum Event {
     Failed(String),
 }
 
-struct Message {
+pub(crate) struct Message {
     gpu: usize,
-    event: Event,
+    pub(crate) event: Event,
 }
 
 /// Lets a worker send events to the supervisor.
+#[derive(Clone)]
 pub struct Reporter {
     gpu: usize,
     tx: Sender<Message>,
+    abandoned: Arc<AtomicBool>,
 }
 
 impl Reporter {
-    fn send(&self, event: Event) {
+    /// A reporter that isn't attached to a supervisor, for a worker running in
+    /// a child process. Its events arrive on the returned receiver.
+    pub(crate) fn detached() -> (Self, Receiver<Message>) {
+        let (tx, rx) = mpsc::channel();
+        let reporter = Self {
+            gpu: 0,
+            tx,
+            abandoned: Arc::new(AtomicBool::new(false)),
+        };
+        (reporter, rx)
+    }
+
+    /// True once the supervisor has given up on this worker. A worker that can
+    /// be interrupted, such as a child process, should then be stopped.
+    pub fn abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abandon(&self) {
+        self.abandoned.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn send(&self, event: Event) {
         // The supervisor only stops listening once it has given up on the
         // workers, so a failed send can be ignored.
         let _ = self.tx.send(Message {
@@ -111,8 +144,14 @@ pub struct Config {
     pub max_setup: Duration,
     /// Shortest time without progress before a GPU is reported as stalled.
     pub min_stall: Duration,
+    /// Shortest time without progress before the supervisor gives up on a GPU
+    /// and marks it hung.
+    pub min_hang: Duration,
     /// Shortest wait for workers to finish their current chunk after the run ends.
     pub min_shutdown_grace: Duration,
+    /// Longest wait for workers that were given up on to exit before the
+    /// summary is printed.
+    pub reap_grace: Duration,
 }
 
 /// The result for one GPU.
@@ -126,8 +165,8 @@ pub enum Verdict {
     },
     /// Failed with an error after testing began.
     Died(String),
-    /// Did not finish within the grace period after the run ended.
-    Hung,
+    /// Stopped making progress, or did not stop when the run ended.
+    Hung(String),
     /// Never started testing, so its health is unknown.
     NotTested(String),
 }
@@ -137,13 +176,16 @@ impl Verdict {
         match self {
             Self::Pass => "PASS",
             Self::Mismatches { .. } | Self::Died(_) => "FAIL",
-            Self::Hung => "HUNG",
+            Self::Hung(_) => "HUNG",
             Self::NotTested(_) => "ERROR",
         }
     }
 
     fn is_failure(&self) -> bool {
-        matches!(self, Self::Mismatches { .. } | Self::Died(_) | Self::Hung)
+        matches!(
+            self,
+            Self::Mismatches { .. } | Self::Died(_) | Self::Hung(_)
+        )
     }
 }
 
@@ -192,6 +234,8 @@ enum Phase {
     Running,
     Finished,
     Failed(String),
+    /// Given up on, with the reason.
+    Hung(String),
 }
 
 struct Gpu {
@@ -210,10 +254,14 @@ struct Gpu {
     reported_gemms: u64,
     reported_at: Instant,
     stalled: bool,
+    /// Shared with the worker's reporter; set when the supervisor gives up on it.
+    abandoned: Arc<AtomicBool>,
+    /// The worker has returned, even if it was given up on first.
+    exited: bool,
 }
 
 impl Gpu {
-    fn new(target: Target, now: Instant) -> Self {
+    fn new(target: Target, now: Instant, abandoned: Arc<AtomicBool>) -> Self {
         Self {
             target,
             phase: Phase::Starting,
@@ -228,11 +276,28 @@ impl Gpu {
             reported_gemms: 0,
             reported_at: now,
             stalled: false,
+            abandoned,
+            exited: false,
         }
     }
 
     fn is_done(&self) -> bool {
-        matches!(self.phase, Phase::Finished | Phase::Failed(_))
+        matches!(
+            self.phase,
+            Phase::Finished | Phase::Failed(_) | Phase::Hung(_)
+        )
+    }
+
+    /// Stops waiting for this GPU and tells its worker to stop if it can.
+    fn give_up(&mut self, reason: String, now: Instant, out: &mut impl Write) {
+        say!(
+            out,
+            "HUNG  gpu {}  {reason}; giving up on it",
+            self.target.ordinal
+        );
+        self.abandoned.store(true, Ordering::SeqCst);
+        self.phase = Phase::Hung(reason);
+        self.ended_at = Some(now);
     }
 
     fn flops_per_gemm(&self) -> f64 {
@@ -245,7 +310,8 @@ impl Gpu {
         match &self.phase {
             Phase::Failed(error) if self.ready_at.is_some() => Verdict::Died(error.clone()),
             Phase::Failed(error) => Verdict::NotTested(error.clone()),
-            Phase::Starting | Phase::Running => Verdict::Hung,
+            Phase::Hung(reason) => Verdict::Hung(reason.clone()),
+            Phase::Starting | Phase::Running => Verdict::Hung("did not stop".to_string()),
             Phase::Finished if self.mismatches > 0 => Verdict::Mismatches {
                 values: self.mismatches,
                 chunks: self.bad_chunks,
@@ -265,6 +331,11 @@ impl Gpu {
 
     fn apply(&mut self, event: Event, now: Instant, out: &mut impl Write) {
         let ordinal = self.target.ordinal;
+        if matches!(self.phase, Phase::Hung(_)) {
+            // Given up on: only note when its worker finally returns.
+            self.exited |= matches!(event, Event::Finished | Event::Failed(_));
+            return;
+        }
         match event {
             Event::Ready(ready) => {
                 say!(out, "gpu {ordinal}  ready: {}", ready.detail);
@@ -300,6 +371,7 @@ impl Gpu {
             Event::Finished => {
                 self.phase = Phase::Finished;
                 self.ended_at = Some(now);
+                self.exited = true;
             }
             Event::Failed(error) => {
                 let when = if self.ready_at.is_some() {
@@ -310,6 +382,7 @@ impl Gpu {
                 say!(out, "ERROR  gpu {ordinal}  {when}: {error}");
                 self.phase = Phase::Failed(error);
                 self.ended_at = Some(now);
+                self.exited = true;
             }
         }
     }
@@ -318,10 +391,13 @@ impl Gpu {
 /// Runs every worker to completion and returns each GPU's verdict.
 ///
 /// The test clock starts once every GPU is ready (or after
-/// [`Config::max_setup`]). When it runs out, or `stop` is set, every worker is
-/// asked to stop and given a grace period to finish its current chunk. Any
-/// that do not are reported as hung; their threads are abandoned and end when
-/// the process exits.
+/// [`Config::max_setup`]). A GPU that stops making progress for too long is
+/// given up on and marked hung while the others carry on. When the clock runs
+/// out, or `stop` is set, every worker is asked to stop and given a grace
+/// period to finish its current chunk; any that do not are also marked hung.
+/// Workers that were given up on are told so through their reporter. A worker
+/// thread that can't be interrupted is left behind and ends when the process
+/// exits.
 pub fn supervise(
     workers: Vec<(Target, Work)>,
     config: &Config,
@@ -340,10 +416,12 @@ pub fn supervise(
             target.name,
             target.detail
         );
-        let mut gpu = Gpu::new(target, launched);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let mut gpu = Gpu::new(target, launched, abandoned.clone());
         let reporter = Reporter {
             gpu: index,
             tx: tx.clone(),
+            abandoned,
         };
         let spawned = thread::Builder::new()
             .name(format!("gpu-{}", gpu.target.ordinal))
@@ -364,6 +442,7 @@ pub fn supervise(
     stop.store(true, Ordering::SeqCst);
     let ended = Instant::now();
     wait_for_workers(&mut gpus, &rx, config, ended, out);
+    reap(&mut gpus, &rx, config.reap_grace, out);
     print_summary(
         &gpus,
         clock.map_or(Duration::ZERO, |start| ended - start),
@@ -377,7 +456,7 @@ pub fn supervise(
 }
 
 /// Runs a worker, turning errors and panics into events.
-fn run_worker(work: Work, reporter: Reporter) {
+pub(crate) fn run_worker(work: Work, reporter: Reporter) {
     let event = match panic::catch_unwind(AssertUnwindSafe(|| work(&reporter))) {
         Ok(Ok(())) => Event::Finished,
         Ok(Err(err)) => Event::Failed(format!("{err:#}")),
@@ -447,6 +526,7 @@ fn run_until_done(
             next_report = Some(now + config.report_every);
         }
         warn_about_stalls(gpus, config, now, out);
+        give_up_on_hung(gpus, config, now, out);
     }
     clock.map(|(start, _)| start)
 }
@@ -506,7 +586,29 @@ fn warn_about_stalls(gpus: &mut [Gpu], config: &Config, now: Instant, out: &mut 
     }
 }
 
-/// Gives workers time to finish their current chunk after being told to stop.
+/// Gives up on running GPUs that have made no progress for too long.
+fn give_up_on_hung(gpus: &mut [Gpu], config: &Config, now: Instant, out: &mut impl Write) {
+    for gpu in gpus.iter_mut() {
+        let chunk_secs = match (&gpu.phase, &gpu.ready) {
+            (Phase::Running, Some(ready)) => ready.chunk_secs,
+            _ => continue,
+        };
+        let limit = config
+            .min_hang
+            .max(Duration::from_secs_f64(chunk_secs * 30.0));
+        let quiet = now - gpu.last_progress;
+        if quiet > limit {
+            gpu.give_up(
+                format!("no progress for {}", format_duration(quiet)),
+                now,
+                out,
+            );
+        }
+    }
+}
+
+/// Gives workers time to finish their current chunk after being told to stop,
+/// and gives up on any that don't.
 fn wait_for_workers(
     gpus: &mut [Gpu],
     rx: &Receiver<Message>,
@@ -532,6 +634,30 @@ fn wait_for_workers(
             Err(_) => break,
         }
     }
+    let now = Instant::now();
+    for gpu in gpus.iter_mut().filter(|gpu| !gpu.is_done()) {
+        let reason = format!(
+            "did not stop within {} of the end of the run",
+            format_duration(grace)
+        );
+        gpu.give_up(reason, now, out);
+    }
+}
+
+/// Waits briefly for workers that were given up on to exit, so that child
+/// processes are killed and collected before burnin exits.
+fn reap(gpus: &mut [Gpu], rx: &Receiver<Message>, grace: Duration, out: &mut impl Write) {
+    let deadline = Instant::now() + grace;
+    while gpus.iter().any(|gpu| !gpu.exited) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok(message) => gpus[message.gpu].apply(message.event, now, out),
+            Err(_) => break,
+        }
+    }
 }
 
 fn print_summary(gpus: &[Gpu], elapsed: Duration, ended: Instant, out: &mut impl Write) {
@@ -553,7 +679,7 @@ fn print_summary(gpus: &[Gpu], elapsed: Duration, ended: Instant, out: &mut impl
                 format!("{values} mismatched values in {chunks} chunk(s)")
             }
             Verdict::Died(error) => format!("failed during the run: {error}"),
-            Verdict::Hung => "did not stop within the grace period".to_string(),
+            Verdict::Hung(reason) => reason.clone(),
             Verdict::NotTested(error) => format!("not tested: {error}"),
         };
         say!(
@@ -593,7 +719,9 @@ mod tests {
             report_every: Duration::from_millis(40),
             max_setup: Duration::from_secs(5),
             min_stall: Duration::from_millis(60),
+            min_hang: Duration::from_secs(60),
             min_shutdown_grace: Duration::from_millis(300),
+            reap_grace: Duration::from_millis(100),
         }
     }
 
@@ -757,9 +885,52 @@ mod tests {
         ];
         let (summary, out) = run(workers, stop, &config());
         release.store(true, Ordering::SeqCst);
-        assert_eq!(verdicts(&summary), vec![Verdict::Pass, Verdict::Hung]);
+        match &verdicts(&summary)[..] {
+            [Verdict::Pass, Verdict::Hung(reason)] => {
+                assert!(reason.starts_with("did not stop within"), "{reason}")
+            }
+            other => panic!("unexpected verdicts {other:?}"),
+        }
         assert_eq!(summary.exit_status(), 1);
         assert!(out.contains("WARNING  gpu 1  no progress"), "{out}");
+    }
+
+    #[test]
+    fn watchdog_gives_up_on_a_stuck_gpu_and_the_rest_carry_on() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers: Vec<(Target, Work)> = vec![
+            (target(0), healthy(&stop, false)),
+            (
+                target(1),
+                Box::new(|reporter| {
+                    ready(reporter);
+                    reporter.progress(1, 4);
+                    // Stuck until the supervisor gives up, as a killed child process would be.
+                    while !reporter.abandoned() {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    anyhow::bail!("killed")
+                }),
+            ),
+        ];
+        let cfg = Config {
+            duration: Duration::from_millis(500),
+            min_hang: Duration::from_millis(100),
+            ..config()
+        };
+        let (summary, out) = run(workers, stop, &cfg);
+        match &verdicts(&summary)[..] {
+            [Verdict::Pass, Verdict::Hung(reason)] => {
+                assert!(reason.starts_with("no progress for"), "{reason}")
+            }
+            other => panic!("unexpected verdicts {other:?}"),
+        }
+        let hung_at = out.find("HUNG  gpu 1").expect("hang reported");
+        assert!(
+            out[hung_at..].contains("gpu 0  pass"),
+            "gpu 0 kept reporting after gpu 1 hung: {out}"
+        );
+        assert!(!out.contains("ERROR  gpu 1"), "{out}");
     }
 
     #[test]
