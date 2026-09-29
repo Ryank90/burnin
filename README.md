@@ -18,9 +18,11 @@ Every GPU is tested at the same time, each in its own child process. A superviso
 | Verdict | Meaning |
 |---|---|
 | `PASS` | Every result matched. |
-| `FAIL` | Some results differed, or the GPU hit an error during the run. |
+| `FAIL` | Some results differed, the GPU hit an error during the run, or it reported uncorrected ECC memory errors or a critical driver error (Xid). |
 | `HUNG` | The GPU stopped making progress, or didn't finish its last chunk within the grace period after the run ended. |
 | `ERROR` | The GPU couldn't be set up, so it wasn't tested. |
+
+Progress lines show each GPU's temperature, power, SM clock and any throttling. The summary adds the peak temperature, average and peak power, average and lowest clock, and every throttle reason seen. It also lists ECC memory errors and critical driver errors (Xid events) that occurred during the run. Corrected ECC errors are reported but don't fail a GPU. Fields a GPU doesn't report are left out; `burnin probe` shows which ones a GPU supports.
 
 `--isolation thread` tests every GPU in threads of a single process instead. That's easier to debug, but a hung GPU can only be reported, not stopped.
 
@@ -66,7 +68,6 @@ On GPUs that share system RAM with the CPU, such as the GB10 in DGX Spark, CUDA'
 ## Roadmap
 
 - More precisions: TF32, FP16, BF16 and FP8.
-- Telemetry in the summary, plus ECC error counts and driver error events. Progress lines already show temperature, power, clock and throttling.
 - JSON output for automation.
 - Prebuilt x86_64 and aarch64 release binaries.
 - An Apple Silicon backend using Metal.

@@ -13,7 +13,7 @@ use cudarc::driver::{CudaContext, result as driver};
 
 use crate::mem::{self, HostMemory, MemSpec};
 use crate::supervisor::{self, Config, Target, Work};
-use crate::telemetry::{Sample, Telemetry};
+use crate::telemetry::{self, Telemetry};
 use crate::units::format_bytes;
 use crate::{Isolation, RunArgs, WorkerArgs, isolation};
 
@@ -294,12 +294,9 @@ pub fn run(args: &RunArgs) -> Result<u8> {
     };
     let host_sharers = infos.iter().filter(|info| info.integrated).count() as u64;
 
-    // Telemetry is read on the supervisor thread, matched to each GPU by PCI address.
+    // Telemetry is read in this process, matched to each GPU by PCI address.
     let telemetry = Telemetry::init().ok();
-    let nvml: Vec<_> = infos
-        .iter()
-        .map(|info| telemetry.as_ref().and_then(|t| t.device(&info.pci_bus_id)))
-        .collect();
+    let pci_bus_ids: Vec<String> = infos.iter().map(|info| info.pci_bus_id.clone()).collect();
 
     let stop = Arc::new(AtomicBool::new(false));
     install_stop_handler(stop.clone())?;
@@ -343,18 +340,15 @@ pub fn run(args: &RunArgs) -> Result<u8> {
         min_shutdown_grace: MIN_SHUTDOWN_GRACE,
         reap_grace: REAP_GRACE,
     };
-    let sample = |index: usize| {
-        nvml[index]
-            .as_ref()
-            .map(|device| Sample::take(device).to_string())
-    };
-    let summary = supervisor::supervise(
-        workers,
-        &config,
-        stop,
-        sample,
-        &mut std::io::stdout().lock(),
-    );
+    let summary = telemetry::watch(telemetry.as_ref(), &pci_bus_ids, |monitor| {
+        supervisor::supervise(
+            workers,
+            &config,
+            stop,
+            monitor,
+            &mut std::io::stdout().lock(),
+        )
+    });
     Ok(summary.exit_status())
 }
 
