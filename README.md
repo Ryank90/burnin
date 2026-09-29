@@ -1,8 +1,8 @@
 # burnin
 
-GPU burn-in and stress testing. burnin keeps a GPU busy with large matrix multiplies and checks that every result it computes is correct, so you can find faulty hardware before it goes into service.
+GPU burn-in and stress testing. burnin keeps every GPU in a machine busy with large matrix multiplies and checks that every result is correct, so you can find faulty hardware before it goes into service.
 
-> **Status: early prototype.** It tests one NVIDIA GPU at a time on Linux. See the [roadmap](#roadmap) for what's coming.
+> **Status: early prototype.** It tests NVIDIA GPUs on Linux. See the [roadmap](#roadmap) for what's coming.
 
 ## How it works
 
@@ -12,6 +12,15 @@ GPU burn-in and stress testing. burnin keeps a GPU busy with large matrix multip
 4. Any difference means the hardware got a calculation wrong.
 
 Chunks are sized to take about 1.5 seconds each. That keeps progress lines, Ctrl-C and error reports prompt on both slow and fast GPUs.
+
+Every GPU is tested at the same time, each by its own worker thread. A supervisor prints each GPU's progress and warns when a GPU stops making progress. When the run ends it gives each GPU its own verdict:
+
+| Verdict | Meaning |
+|---|---|
+| `PASS` | Every result matched. |
+| `FAIL` | Some results differed, or the GPU hit an error during the run. |
+| `HUNG` | The GPU didn't finish its last chunk within the grace period after the run ended. |
+| `ERROR` | The GPU couldn't be set up, so it wasn't tested. |
 
 ## Requirements
 
@@ -34,8 +43,9 @@ The binary is `target/release/burnin`.
 ```sh
 burnin list                     # GPUs burnin can see
 burnin probe                    # device, memory and telemetry details
-burnin run 10m                  # stress GPU 0 for ten minutes
-burnin run 1h -d 1 -p fp64      # GPU 1, double precision, one hour
+burnin run 10m                  # stress every GPU for ten minutes
+burnin run 1h -d 1 -p fp64      # GPU 1 only, double precision, one hour
+burnin run 30m -d 0,2           # GPUs 0 and 2
 burnin run 30m -m 50%           # use half of the usable memory
 burnin run 30s --inject-fault   # corrupt one result on purpose to check detection
 ```
@@ -43,20 +53,19 @@ burnin run 30s --inject-fault   # corrupt one result on purpose to check detecti
 Durations accept seconds, or units such as `90s`, `10m` and `2h`. Memory accepts a percentage such as `90%`, or a size such as `16G`, `512M` or `4096` (MiB when there's no unit).
 
 Exit status:
-- `0` when every result matched.
-- `1` when mismatches were found.
-- `2` on error.
+- `0` when every GPU passed.
+- `1` when any GPU failed or hung.
+- `2` when a GPU couldn't be tested, or burnin itself hit an error.
 
 ### Unified-memory GPUs
 
-On GPUs that share system RAM with the CPU, such as the GB10 in DGX Spark, CUDA's figure for free memory leaves out reclaimable page cache. burnin sizes its memory from the system's available memory instead, and leaves a reserve for the OS. `burnin probe` shows both figures and the budget it would use.
+On GPUs that share system RAM with the CPU, such as the GB10 in DGX Spark, CUDA's figure for free memory leaves out reclaimable page cache. burnin sizes its memory from the system's available memory instead, and leaves a reserve for the OS. If several such GPUs are tested at once, they split that memory between them. `burnin probe` shows both figures and the budget it would use.
 
 ## Roadmap
 
-- Every GPU in a machine at once, each in its own process so a hung GPU can be stopped without losing the others.
-- A watchdog that flags GPUs that stop making progress.
+- Each GPU in its own process, so a hung GPU can be killed while the others carry on. Today a hung GPU is reported and left behind when burnin exits.
 - More precisions: TF32, FP16, BF16 and FP8.
-- Telemetry in the report: temperature, power, clocks, throttling, ECC errors and driver error events.
+- Telemetry in the summary, plus ECC error counts and driver error events. Progress lines already show temperature, power, clock and throttling.
 - JSON output for automation.
 - Prebuilt x86_64 and aarch64 release binaries.
 - An Apple Silicon backend using Metal.

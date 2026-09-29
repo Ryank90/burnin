@@ -1,18 +1,27 @@
-//! CUDA backend: device discovery, probing and the stress loop.
+//! CUDA backend: device discovery, probing and running the stress test.
 
 mod burn;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use cudarc::driver::CudaContext;
-use cudarc::driver::sys::CUdevice_attribute as Attr;
+use cudarc::driver::sys::{CUdevice, CUdevice_attribute as Attr};
+use cudarc::driver::{CudaContext, result as driver};
 
-pub use burn::run;
-
+use crate::RunArgs;
 use crate::mem::{self, HostMemory, MemSpec};
-use crate::telemetry::Telemetry;
+use crate::supervisor::{self, Config, Target, Work};
+use crate::telemetry::{Sample, Telemetry};
 use crate::units::format_bytes;
+
+/// Longest wait for every GPU to finish setting up before the clock starts anyway.
+const MAX_SETUP: Duration = Duration::from_secs(120);
+/// Shortest time without progress before a GPU is reported as stalled.
+const MIN_STALL: Duration = Duration::from_secs(60);
+/// Shortest wait for GPUs to finish their current chunk once the run ends.
+const MIN_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// Fails with a readable message when a CUDA library is missing, instead of
 /// the panic cudarc raises on first use.
@@ -48,19 +57,8 @@ fn device_count() -> Result<usize> {
     Ok(count.max(0) as usize)
 }
 
-/// Opens a device, checking the ordinal first so the error is clear.
-fn open(ordinal: usize) -> Result<Arc<CudaContext>> {
-    let count = device_count()?;
-    if count == 0 {
-        bail!("no CUDA devices found");
-    }
-    if ordinal >= count {
-        bail!("device {ordinal} does not exist; found {count} device(s)");
-    }
-    CudaContext::new(ordinal).with_context(|| format!("could not open device {ordinal}"))
-}
-
 /// Static facts about a device.
+#[derive(Clone)]
 pub struct DeviceInfo {
     pub ordinal: usize,
     pub name: String,
@@ -74,17 +72,28 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
-    fn query(ctx: &Arc<CudaContext>) -> Result<Self> {
-        let domain = ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID)?;
-        let bus = ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID)?;
-        let device = ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID)?;
+    /// Reads a device's details without creating a context on it.
+    fn query(ordinal: usize) -> Result<Self> {
+        let dev = driver::device::get(ordinal as i32)
+            .with_context(|| format!("could not find device {ordinal}"))?;
+        let attribute = |attr: Attr| -> Result<i32> {
+            // SAFETY: `dev` is a valid device handle from cuDeviceGet.
+            Ok(unsafe { driver::device::get_attribute(dev, attr) }?)
+        };
+        let domain = attribute(Attr::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID)?;
+        let bus = attribute(Attr::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID)?;
+        let device = attribute(Attr::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID)?;
         Ok(Self {
-            ordinal: ctx.ordinal(),
-            name: ctx.name()?,
-            compute_capability: ctx.compute_capability()?,
-            sm_count: ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32,
-            integrated: ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_INTEGRATED)? != 0,
-            total_mem: ctx.total_mem()? as u64,
+            ordinal,
+            name: driver::device::get_name(dev)?,
+            compute_capability: (
+                attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?,
+                attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?,
+            ),
+            sm_count: attribute(Attr::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32,
+            integrated: attribute(Attr::CU_DEVICE_ATTRIBUTE_INTEGRATED)? != 0,
+            // SAFETY: as above.
+            total_mem: unsafe { driver::device::total_mem(dev) }? as u64,
             pci_bus_id: format!("{domain:08X}:{bus:02X}:{device:02X}.0"),
         })
     }
@@ -93,6 +102,26 @@ impl DeviceInfo {
         let (major, minor) = self.compute_capability;
         format!("sm_{major}{minor}")
     }
+
+    /// Architecture, size and PCI address, e.g. for a run's header.
+    fn summary(&self) -> String {
+        format!(
+            "{}, {} SMs, {}, {}{}",
+            self.arch(),
+            self.sm_count,
+            format_bytes(self.total_mem),
+            self.pci_bus_id,
+            if self.integrated {
+                ", unified memory"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+fn raw_device(ordinal: usize) -> Result<CUdevice> {
+    Ok(driver::device::get(ordinal as i32)?)
 }
 
 pub fn list() -> Result<()> {
@@ -102,7 +131,7 @@ pub fn list() -> Result<()> {
         println!("no CUDA devices found");
     }
     for ordinal in 0..count {
-        let info = DeviceInfo::query(&CudaContext::new(ordinal)?)?;
+        let info = DeviceInfo::query(ordinal)?;
         println!(
             "{:>2}  {:<32} {:<7} {:>10}  {}{}",
             info.ordinal,
@@ -154,24 +183,33 @@ pub fn probe(only: Option<usize>) -> Result<()> {
     }
 
     let count = device_count()?;
-    let ordinals: Vec<usize> = match only {
+    let infos = (0..count)
+        .map(DeviceInfo::query)
+        .collect::<Result<Vec<_>>>()?;
+    // A default run tests every GPU, so unified-memory GPUs share host memory.
+    let host_sharers = infos.iter().filter(|info| info.integrated).count() as u64;
+    let selected: Vec<&DeviceInfo> = match only {
         Some(ordinal) if ordinal >= count => {
             bail!("device {ordinal} does not exist; found {count} device(s)")
         }
-        Some(ordinal) => vec![ordinal],
-        None => (0..count).collect(),
+        Some(ordinal) => vec![&infos[ordinal]],
+        None => infos.iter().collect(),
     };
-    if ordinals.is_empty() {
+    if selected.is_empty() {
         println!("no CUDA devices found");
     }
 
-    for ordinal in ordinals {
-        let ctx = CudaContext::new(ordinal)?;
-        let info = DeviceInfo::query(&ctx)?;
+    for info in selected {
+        let ctx = CudaContext::new(info.ordinal)?;
         let (free, total) = ctx.mem_get_info()?;
-        let yes_no = |value: i32| if value != 0 { "yes" } else { "no" };
+        let dev = raw_device(info.ordinal)?;
+        let flag = |attr: Attr| -> Result<&'static str> {
+            // SAFETY: `dev` is a valid device handle from cuDeviceGet.
+            let value = unsafe { driver::device::get_attribute(dev, attr) }?;
+            Ok(if value != 0 { "yes" } else { "no" })
+        };
 
-        println!("device {ordinal}: {}", info.name);
+        println!("device {}: {}", info.ordinal, info.name);
         println!(
             "  {:<18}{} ({} SMs)",
             "architecture",
@@ -182,19 +220,17 @@ pub fn probe(only: Option<usize>) -> Result<()> {
         println!(
             "  {:<18}{}",
             "unified memory",
-            yes_no(info.integrated as i32)
+            if info.integrated { "yes" } else { "no" }
         );
         println!(
             "  {:<18}{}",
             "pageable access",
-            yes_no(ctx.attribute(
-                Attr::CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES
-            )?)
+            flag(Attr::CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES)?
         );
         println!(
             "  {:<18}{}",
             "ecc",
-            yes_no(ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_ECC_ENABLED)?)
+            flag(Attr::CU_DEVICE_ATTRIBUTE_ECC_ENABLED)?
         );
         println!(
             "  {:<18}{} free of {}",
@@ -204,7 +240,7 @@ pub fn probe(only: Option<usize>) -> Result<()> {
         );
 
         let spec = MemSpec::default();
-        let budget = mem::budget(spec, free as u64, info.integrated, host);
+        let budget = mem::budget(spec, free as u64, info.integrated, host, host_sharers);
         let square = (crate::DEFAULT_MATRIX_SIZE * crate::DEFAULT_MATRIX_SIZE) as u64;
         println!(
             "  {:<18}{} ({}): {} fp32 or {} fp64 result matrices",
@@ -224,4 +260,98 @@ pub fn probe(only: Option<usize>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Tests the selected GPUs in parallel and returns the process exit status.
+pub fn run(args: &RunArgs) -> Result<u8> {
+    require_libraries(true, true)?;
+    if args.matrix_size == 0 || args.matrix_size > i32::MAX as usize {
+        bail!("matrix size must be between 1 and {}", i32::MAX);
+    }
+    if args.chunk_secs.is_nan() || args.chunk_secs <= 0.0 {
+        bail!("chunk length must be greater than zero");
+    }
+    if args.tolerance.is_nan() || args.tolerance < 0.0 {
+        bail!("tolerance must not be negative");
+    }
+
+    let count = device_count()?;
+    if count == 0 {
+        bail!("no CUDA devices found");
+    }
+    let ordinals = supervisor::select_devices(&args.devices, count).map_err(anyhow::Error::msg)?;
+    let infos = ordinals
+        .into_iter()
+        .map(DeviceInfo::query)
+        .collect::<Result<Vec<_>>>()?;
+    let ptx = burn::compile_kernels()?;
+    let host_sharers = infos.iter().filter(|info| info.integrated).count() as u64;
+
+    // Telemetry is read on the supervisor thread, matched to each GPU by PCI address.
+    let telemetry = Telemetry::init().ok();
+    let nvml: Vec<_> = infos
+        .iter()
+        .map(|info| telemetry.as_ref().and_then(|t| t.device(&info.pci_bus_id)))
+        .collect();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    install_stop_handler(stop.clone())?;
+
+    println!(
+        "testing {} {} with {}; Ctrl-C stops early",
+        infos.len(),
+        if infos.len() == 1 { "GPU" } else { "GPUs" },
+        args.precision.name()
+    );
+    let workers = infos
+        .into_iter()
+        .map(|info| {
+            let target = Target {
+                ordinal: info.ordinal,
+                name: info.name.clone(),
+                detail: info.summary(),
+            };
+            let (ptx, args, stop) = (ptx.clone(), args.clone(), stop.clone());
+            let work: Work = Box::new(move |reporter| {
+                burn::worker(&info, ptx, &args, host_sharers, reporter, &stop)
+            });
+            (target, work)
+        })
+        .collect();
+
+    let config = Config {
+        duration: args.duration,
+        report_every: args.report_every,
+        max_setup: MAX_SETUP,
+        min_stall: MIN_STALL,
+        min_shutdown_grace: MIN_SHUTDOWN_GRACE,
+    };
+    let sample = |index: usize| {
+        nvml[index]
+            .as_ref()
+            .map(|device| Sample::take(device).to_string())
+    };
+    let summary = supervisor::supervise(
+        workers,
+        &config,
+        stop,
+        sample,
+        &mut std::io::stdout().lock(),
+    );
+    Ok(summary.exit_status())
+}
+
+/// The first Ctrl-C (or SIGTERM) lets every GPU finish its current chunk and
+/// prints the summary; a second one exits immediately.
+fn install_stop_handler(stop: Arc<AtomicBool>) -> Result<()> {
+    let presses = AtomicUsize::new(0);
+    ctrlc::set_handler(move || {
+        if presses.fetch_add(1, Ordering::SeqCst) == 0 {
+            eprintln!("\nstopping after the current chunk; press Ctrl-C again to quit now");
+            stop.store(true, Ordering::SeqCst);
+        } else {
+            std::process::exit(130);
+        }
+    })
+    .context("could not install the Ctrl-C handler")
 }

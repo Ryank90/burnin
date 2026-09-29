@@ -5,6 +5,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 mod mem;
+mod supervisor;
 mod units;
 
 #[cfg(target_os = "linux")]
@@ -27,7 +28,8 @@ pub const DEFAULT_MATRIX_SIZE: usize = 8192;
     name = "burnin",
     version,
     about = "GPU burn-in and stress testing",
-    after_help = "Exit status: 0 when every result matched, 1 when mismatches were found, 2 on error."
+    after_help = "Exit status: 0 when every GPU passed, 1 when any GPU failed, \
+                  2 when a GPU could not be tested or on error."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,7 +46,7 @@ enum Command {
         #[arg(short, long)]
         device: Option<usize>,
     },
-    /// Stress a GPU and check that every result it computes matches.
+    /// Stress GPUs in parallel and check that every result they compute matches.
     Run(RunArgs),
 }
 
@@ -54,9 +56,15 @@ pub struct RunArgs {
     #[arg(default_value = "60s", value_parser = units::parse_duration)]
     pub duration: Duration,
 
-    /// Device to test.
-    #[arg(short, long, default_value_t = 0)]
-    pub device: usize,
+    /// GPUs to test, as a comma-separated list such as 0,2,3. Every GPU when omitted.
+    #[arg(
+        short = 'd',
+        long,
+        visible_alias = "device",
+        value_name = "LIST",
+        value_delimiter = ','
+    )]
+    pub devices: Vec<usize>,
 
     /// Arithmetic precision of the matrix multiplies.
     #[arg(short, long, value_enum, default_value_t = Precision::Fp32)]
@@ -93,6 +101,15 @@ pub enum Precision {
     Fp64,
 }
 
+impl Precision {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fp32 => "fp32",
+            Self::Fp64 => "fp64",
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match dispatch(cli.command) {
@@ -109,14 +126,7 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     match command {
         Command::List => cuda::list().map(|()| ExitCode::SUCCESS),
         Command::Probe { device } => cuda::probe(device).map(|()| ExitCode::SUCCESS),
-        Command::Run(args) => {
-            let outcome = cuda::run(&args)?;
-            Ok(if outcome.passed() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            })
-        }
+        Command::Run(args) => cuda::run(&args).map(ExitCode::from),
     }
 }
 
@@ -141,7 +151,7 @@ mod tests {
     fn run_defaults() {
         let args = run_args(&["burnin", "run"]);
         assert_eq!(args.duration, Duration::from_secs(60));
-        assert_eq!(args.device, 0);
+        assert!(args.devices.is_empty(), "every GPU by default");
         assert_eq!(args.precision, Precision::Fp32);
         assert_eq!(args.mem, MemSpec::Percent(mem::DEFAULT_PERCENT));
         assert_eq!(args.matrix_size, DEFAULT_MATRIX_SIZE);
@@ -167,6 +177,23 @@ mod tests {
             run_args(&["burnin", "run", "--mem=16G"]).mem,
             MemSpec::Bytes(16 << 30)
         );
+    }
+
+    #[test]
+    fn device_lists() {
+        assert_eq!(
+            run_args(&["burnin", "run", "-d", "0,2"]).devices,
+            vec![0, 2]
+        );
+        assert_eq!(
+            run_args(&["burnin", "run", "-d", "1", "-d", "3"]).devices,
+            vec![1, 3]
+        );
+        assert_eq!(
+            run_args(&["burnin", "run", "--device", "2"]).devices,
+            vec![2]
+        );
+        assert!(Cli::try_parse_from(["burnin", "run", "-d", "x"]).is_err());
     }
 
     #[test]

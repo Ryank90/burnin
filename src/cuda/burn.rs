@@ -1,4 +1,4 @@
-//! The stress loop.
+//! The stress loop for one GPU.
 //!
 //! Memory is filled with result matrices that should all be identical: each
 //! one is the product of the same two inputs. Every pass recomputes a
@@ -8,7 +8,7 @@
 //! progress, stopping and error reports stay prompt on slow and fast GPUs alike.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -18,12 +18,12 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, CudaViewMut, DeviceRepr, LaunchConfig,
     PushKernelArg, ValidAsZeroBits,
 };
-use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
+use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 
-use super::{DeviceInfo, open, require_libraries};
+use super::DeviceInfo;
 use crate::mem::{self, HostMemory};
-use crate::telemetry::{Sample, Telemetry};
-use crate::units::{format_bytes, format_duration};
+use crate::supervisor::{Ready, Reporter};
+use crate::units::format_bytes;
 use crate::{Precision, RunArgs};
 
 const KERNELS: &str = include_str!("kernels.cu");
@@ -61,73 +61,66 @@ impl Element for f64 {
     const POISON: Self = 1.0e300;
 }
 
-pub struct Outcome {
-    pub mismatches: u64,
+/// Compiles the device kernels once; every worker loads the result.
+pub fn compile_kernels() -> Result<Ptx> {
+    let options = CompileOptions {
+        name: Some("burnin_kernels.cu".into()),
+        ..Default::default()
+    };
+    compile_ptx_with_opts(KERNELS, options)
+        .map_err(|err| anyhow::anyhow!("NVRTC could not compile the device kernels: {err:?}"))
 }
 
-impl Outcome {
-    pub fn passed(&self) -> bool {
-        self.mismatches == 0
-    }
+/// Everything one worker needs.
+struct Job<'a> {
+    ctx: Arc<CudaContext>,
+    info: &'a DeviceInfo,
+    args: &'a RunArgs,
+    /// Number of unified-memory GPUs sharing host memory in this run.
+    host_sharers: u64,
+    reporter: &'a Reporter,
+    stop: &'a AtomicBool,
 }
 
-pub fn run(args: &RunArgs) -> Result<Outcome> {
-    require_libraries(true, true)?;
-    if args.matrix_size == 0 || args.matrix_size > i32::MAX as usize {
-        bail!("matrix size must be between 1 and {}", i32::MAX);
-    }
-    if args.chunk_secs.is_nan() || args.chunk_secs <= 0.0 {
-        bail!("chunk length must be greater than zero");
-    }
-    if args.tolerance.is_nan() || args.tolerance < 0.0 {
-        bail!("tolerance must not be negative");
-    }
-
-    let stop = Arc::new(AtomicBool::new(false));
-    install_stop_handler(stop.clone())?;
-    let ctx = open(args.device)?;
+/// Tests one GPU until `stop` is set.
+pub fn worker(
+    info: &DeviceInfo,
+    ptx: Ptx,
+    args: &RunArgs,
+    host_sharers: u64,
+    reporter: &Reporter,
+    stop: &AtomicBool,
+) -> Result<()> {
+    let ctx = CudaContext::new(info.ordinal).context("could not create a CUDA context")?;
+    let job = Job {
+        ctx,
+        info,
+        args,
+        host_sharers,
+        reporter,
+        stop,
+    };
     match args.precision {
-        Precision::Fp32 => burn::<f32>(&ctx, args, &stop),
-        Precision::Fp64 => burn::<f64>(&ctx, args, &stop),
+        Precision::Fp32 => burn::<f32>(&job, ptx),
+        Precision::Fp64 => burn::<f64>(&job, ptx),
     }
 }
 
-/// The first Ctrl-C (or SIGTERM) finishes the current chunk and prints the
-/// summary; a second one exits immediately.
-fn install_stop_handler(stop: Arc<AtomicBool>) -> Result<()> {
-    let presses = AtomicUsize::new(0);
-    ctrlc::set_handler(move || {
-        if presses.fetch_add(1, Ordering::SeqCst) == 0 {
-            eprintln!("\nstopping after the current chunk; press Ctrl-C again to quit now");
-            stop.store(true, Ordering::SeqCst);
-        } else {
-            std::process::exit(130);
-        }
-    })
-    .context("could not install the Ctrl-C handler")
-}
-
-#[derive(Default)]
-struct Totals {
-    passes: u64,
-    gemms: u64,
-    mismatches: u64,
-    bad_chunks: u64,
-}
-
-fn burn<T: Element>(ctx: &Arc<CudaContext>, args: &RunArgs, stop: &AtomicBool) -> Result<Outcome>
+fn burn<T: Element>(job: &Job, ptx: Ptx) -> Result<()>
 where
     CudaBlas: Gemm<T>,
 {
+    let Job {
+        ctx, info, args, ..
+    } = job;
     // Everything runs on one stream, so cudarc's cross-stream event tracking
     // would only add overhead.
     // SAFETY: called before any allocation or launch on this context.
     unsafe { ctx.disable_event_tracking() };
 
-    let info = DeviceInfo::query(ctx)?;
     let stream = ctx.default_stream();
     let blas = CudaBlas::new(stream.clone()).context("could not create a cuBLAS handle")?;
-    let kernels = Kernels::load::<T>(ctx, info.sm_count)?;
+    let kernels = Kernels::load::<T>(ctx, ptx, info.sm_count)?;
 
     let n = args.matrix_size;
     let elems = n * n;
@@ -139,8 +132,14 @@ where
     } else {
         None
     };
-    let budget = mem::budget(args.mem, device_free as u64, info.integrated, host);
-    let wanted = mem::result_slots(budget.bytes, matrix_bytes);
+    let budget = mem::budget(
+        args.mem,
+        device_free as u64,
+        info.integrated,
+        host,
+        job.host_sharers,
+    );
+    let wanted = mem::result_slots(budget.bytes, matrix_bytes) as usize;
     if wanted < 2 {
         bail!(
             "a {} budget cannot hold two {n}x{n} inputs and two results ({} each); \
@@ -150,37 +149,13 @@ where
         );
     }
 
-    println!(
-        "device {}: {} ({}, {} SMs{})",
-        info.ordinal,
-        info.name,
-        info.arch(),
-        info.sm_count,
-        if info.integrated {
-            ", unified memory"
-        } else {
-            ""
-        }
-    );
-    println!(
-        "memory budget {} ({})",
-        format_bytes(budget.bytes),
-        mem::describe(args.mem, &budget)
-    );
-
     // SAFETY: both inputs are fully written by the fill kernel before use.
     let mut a = unsafe { stream.alloc::<T>(elems) }?;
     let mut b = unsafe { stream.alloc::<T>(elems) }?;
     kernels.fill(&stream, &mut a, SEED_A)?;
     kernels.fill(&stream, &mut b, SEED_B)?;
-    let (mut results, slots) = alloc_results::<T>(&stream, elems, wanted as usize)?;
+    let (mut results, slots) = alloc_results::<T>(&stream, elems, wanted)?;
     let mut mismatch_counter = stream.alloc_zeros::<u64>(1)?;
-    println!(
-        "{slots} result matrices of {n}x{n} {} ({} each, {} in total)",
-        T::NAME,
-        format_bytes(matrix_bytes),
-        format_bytes(matrix_bytes * slots as u64)
-    );
 
     // Warm up once so cuBLAS has picked its kernels, then time two GEMMs to
     // size the chunks.
@@ -194,35 +169,33 @@ where
     let secs_per_gemm = timer.elapsed().as_secs_f64() / 2.0;
     let flops_per_gemm = 2.0 * (n as f64).powi(3);
     let chunk = ((args.chunk_secs / secs_per_gemm).round() as usize).clamp(1, slots - 1);
-    println!(
-        "one GEMM takes {:.1} ms ({:.2} TFLOP/s), so each chunk runs {chunk}",
-        secs_per_gemm * 1e3,
-        flops_per_gemm / secs_per_gemm / 1e12
-    );
 
-    let telemetry = Telemetry::init().ok();
-    let nvml_device = telemetry.as_ref().and_then(|t| t.device(&info.pci_bus_id));
-    println!(
-        "running for {}; Ctrl-C stops early",
-        format_duration(args.duration)
-    );
-    println!();
+    let reduced = if slots < wanted {
+        format!(", reduced from {wanted} after allocation failures")
+    } else {
+        String::new()
+    };
+    job.reporter.ready(Ready {
+        detail: format!(
+            "{slots} {} results of {n}x{n}, {} ({}{reduced}); {chunk} GEMMs per chunk at {:.2} TFLOP/s",
+            T::NAME,
+            format_bytes(matrix_bytes * slots as u64),
+            mem::describe(args.mem, &budget),
+            flops_per_gemm / secs_per_gemm / 1e12
+        ),
+        flops_per_gemm,
+        chunk_secs: chunk as f64 * secs_per_gemm,
+    });
 
-    let start = Instant::now();
-    let deadline = start + args.duration;
-    let mut totals = Totals::default();
-    let mut window_start = start;
-    let mut window_gemms = 0u64;
-    let mut next_report = start + args.report_every;
+    let mut pass = 0;
+    let mut gemms = 0;
     let mut inject = args.inject_fault;
-
-    'run: loop {
-        totals.passes += 1;
+    while !job.stop.load(Ordering::SeqCst) {
+        pass += 1;
         // A fresh reference for this pass, so a fault in an earlier pass
         // cannot hide one in this pass.
         gemm(&blas, n, &a, &b, &mut results.slice_mut(0..elems))?;
-        window_gemms += 1;
-        totals.gemms += 1;
+        gemms += 1;
 
         let mut first = 1;
         while first < slots {
@@ -250,63 +223,18 @@ where
                 args.tolerance,
                 &mut mismatch_counter,
             )?;
-            window_gemms += count as u64;
-            totals.gemms += count as u64;
+            gemms += count as u64;
             if found > 0 {
-                totals.mismatches += found;
-                totals.bad_chunks += 1;
-                println!(
-                    "MISMATCH  pass {} results {}-{}: {found} values differ from the reference",
-                    totals.passes,
-                    first,
-                    first + count - 1
-                );
+                job.reporter.mismatch(pass, first, first + count - 1, found);
             }
-
-            let now = Instant::now();
-            if now >= next_report {
-                let secs = (now - window_start).as_secs_f64();
-                let tflops = window_gemms as f64 * flops_per_gemm / secs / 1e12;
-                let sample = nvml_device.as_ref().map(Sample::take);
-                println!(
-                    "{:>8}  pass {:<4} {:>7.2} TFLOP/s  mismatches {:<6} {}",
-                    format_duration(now - start),
-                    totals.passes,
-                    tflops,
-                    totals.mismatches,
-                    sample.map(|s| s.to_string()).unwrap_or_default()
-                );
-                window_start = now;
-                window_gemms = 0;
-                next_report = now + args.report_every;
-            }
-            if stop.load(Ordering::SeqCst) || now >= deadline {
-                break 'run;
+            job.reporter.progress(pass, gemms);
+            if job.stop.load(Ordering::SeqCst) {
+                break;
             }
             first += count;
         }
     }
-
-    let elapsed = start.elapsed();
-    println!();
-    println!(
-        "{} GEMMs in {} passes over {}, averaging {:.2} TFLOP/s",
-        totals.gemms,
-        totals.passes,
-        format_duration(elapsed),
-        totals.gemms as f64 * flops_per_gemm / elapsed.as_secs_f64() / 1e12
-    );
-    if totals.mismatches == 0 {
-        println!("PASS  every result matched");
-    } else {
-        println!(
-            "FAIL  {} mismatched values in {} chunks",
-            totals.mismatches, totals.bad_chunks
-        );
-    }
-    Ok(Outcome {
-        mismatches: totals.mismatches,
-    })
+    Ok(())
 }
 
 /// `c = a * b` for square column-major matrices.
@@ -349,11 +277,7 @@ fn alloc_results<T: Element>(
         // SAFETY: every result is written by a GEMM before it is read.
         match unsafe { stream.alloc::<T>(slots * elems) } {
             Ok(buffer) => return Ok((buffer, slots)),
-            Err(err) if slots > 2 => {
-                let fewer = (slots * 9 / 10).clamp(2, slots - 1);
-                eprintln!("could not allocate {slots} result matrices ({err}); trying {fewer}");
-                slots = fewer;
-            }
+            Err(_) if slots > 2 => slots = (slots * 9 / 10).clamp(2, slots - 1),
             Err(err) => return Err(err).context("could not allocate memory for results"),
         }
     }
@@ -366,14 +290,7 @@ struct Kernels {
 }
 
 impl Kernels {
-    fn load<T: Element>(ctx: &Arc<CudaContext>, sm_count: u32) -> Result<Self> {
-        let options = CompileOptions {
-            name: Some("burnin_kernels.cu".into()),
-            ..Default::default()
-        };
-        let ptx = compile_ptx_with_opts(KERNELS, options).map_err(|err| {
-            anyhow::anyhow!("NVRTC could not compile the device kernels: {err:?}")
-        })?;
+    fn load<T: Element>(ctx: &Arc<CudaContext>, ptx: Ptx, sm_count: u32) -> Result<Self> {
         let module = ctx
             .load_module(ptx)
             .context("could not load the device kernels")?;
