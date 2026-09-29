@@ -7,6 +7,7 @@
 mod isolation;
 mod mem;
 mod monitor;
+mod output;
 mod supervisor;
 mod units;
 
@@ -22,6 +23,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::mem::MemSpec;
+use crate::output::Format;
 
 /// Default width of the square matrices.
 pub const DEFAULT_MATRIX_SIZE: usize = 8192;
@@ -108,6 +110,10 @@ pub struct RunArgs {
     /// Give up on a GPU that makes no progress for this long, and stop its process.
     #[arg(long, default_value = "3m", value_parser = units::parse_duration)]
     pub hang_timeout: Duration,
+
+    /// Output format: human-readable text, or JSON Lines ending with a summary object.
+    #[arg(long, value_enum, default_value_t = Format::Human)]
+    pub format: Format,
 }
 
 impl RunArgs {
@@ -264,6 +270,15 @@ mod tests {
         assert!(!args.inject_fault);
         assert_eq!(args.isolation, Isolation::Process);
         assert_eq!(args.hang_timeout, Duration::from_secs(180));
+        assert_eq!(args.format, Format::Human);
+    }
+
+    #[test]
+    fn json_format() {
+        assert_eq!(
+            run_args(&["burnin", "run", "--format", "json"]).format,
+            Format::Json
+        );
     }
 
     #[test]

@@ -75,13 +75,34 @@ Exit status:
 - `1` when any GPU failed or hung.
 - `2` when a GPU couldn't be tested, or burnin itself hit an error.
 
+### JSON output
+
+`burnin run --format json` writes [JSON Lines](https://jsonlines.org) to stdout, one object per event, instead of text. Each object has an `event` field:
+
+| Event | When |
+|---|---|
+| `start` | The run begins: burnin version, precision and GPU count. |
+| `gpu` | Once for each GPU to be tested. |
+| `ready` | A GPU is set up and testing has begun. |
+| `running` | Every GPU is ready and the clock has started. |
+| `progress` | Every `--report-every`: pass, throughput, mismatches and telemetry for each GPU. |
+| `mismatch`, `hardware`, `stalled`, `recovered`, `hung`, `error` | As they happen. |
+| `summary` | Always last: the overall `result` and `exit_status`, and each GPU's verdict, throughput, telemetry and hardware errors. |
+
+To act only on the outcome, read the last line:
+
+```sh
+burnin run 10m --format json | tail -n 1 | jq '.gpus[] | {gpu, verdict, detail}'
+```
+
+Errors that stop burnin before testing starts still go to stderr as text, with exit status 2.
+
 ### Unified-memory GPUs
 
 On GPUs that share system RAM with the CPU, such as the GB10 in DGX Spark, CUDA's figure for free memory leaves out reclaimable page cache. burnin sizes its memory from the system's available memory instead, and leaves a reserve for the OS. If several such GPUs are tested at once, they split that memory between them. `burnin probe` shows both figures and the budget it would use.
 
 ## Roadmap
 
-- JSON output for automation.
 - Prebuilt x86_64 and aarch64 release binaries.
 - An Apple Silicon backend using Metal.
 
