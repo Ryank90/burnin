@@ -217,9 +217,10 @@ pub fn describe(spec: MemSpec, budget: &Budget) -> String {
     }
 }
 
-/// Number of result matrices that fit in `budget` alongside the two input matrices.
-pub fn result_slots(budget: u64, matrix_bytes: u64) -> u64 {
-    (budget / matrix_bytes).saturating_sub(2)
+/// Number of result matrices that fit in `budget` alongside the two input
+/// matrices. Inputs can be smaller than results, as with FP8.
+pub fn result_slots(budget: u64, input_bytes: u64, result_bytes: u64) -> u64 {
+    budget.saturating_sub(2 * input_bytes) / result_bytes
 }
 
 #[cfg(test)]
@@ -317,7 +318,13 @@ Cached:          61203412 kB
     #[test]
     fn counts_result_slots() {
         let matrix = 256 * MIB;
-        assert_eq!(result_slots(10 * GIB, matrix), 38);
-        assert_eq!(result_slots(matrix, matrix), 0);
+        assert_eq!(result_slots(10 * GIB, matrix, matrix), 38);
+        assert_eq!(result_slots(matrix, matrix, matrix), 0);
+    }
+
+    #[test]
+    fn smaller_inputs_leave_room_for_more_results() {
+        // FP8 inputs are a quarter the size of their FP32 results.
+        assert_eq!(result_slots(10 * GIB, 64 * MIB, 256 * MIB), 39);
     }
 }
