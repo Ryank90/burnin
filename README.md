@@ -13,14 +13,16 @@ GPU burn-in and stress testing. burnin keeps every GPU in a machine busy with la
 
 Chunks are sized to take about 1.5 seconds each. That keeps progress lines, Ctrl-C and error reports prompt on both slow and fast GPUs.
 
-Every GPU is tested at the same time, each by its own worker thread. A supervisor prints each GPU's progress and warns when a GPU stops making progress. When the run ends it gives each GPU its own verdict:
+Every GPU is tested at the same time, each in its own child process. A supervisor prints each GPU's progress and warns when a GPU goes quiet. If a GPU makes no progress for `--hang-timeout` (3 minutes by default), the supervisor gives up on it and kills its process, and the other GPUs carry on. When the run ends, each GPU gets its own verdict:
 
 | Verdict | Meaning |
 |---|---|
 | `PASS` | Every result matched. |
 | `FAIL` | Some results differed, or the GPU hit an error during the run. |
-| `HUNG` | The GPU didn't finish its last chunk within the grace period after the run ended. |
+| `HUNG` | The GPU stopped making progress, or didn't finish its last chunk within the grace period after the run ended. |
 | `ERROR` | The GPU couldn't be set up, so it wasn't tested. |
+
+`--isolation thread` tests every GPU in threads of a single process instead. That's easier to debug, but a hung GPU can only be reported, not stopped.
 
 ## Requirements
 
@@ -63,7 +65,6 @@ On GPUs that share system RAM with the CPU, such as the GB10 in DGX Spark, CUDA'
 
 ## Roadmap
 
-- Each GPU in its own process, so a hung GPU can be killed while the others carry on. Today a hung GPU is reported and left behind when burnin exits.
 - More precisions: TF32, FP16, BF16 and FP8.
 - Telemetry in the summary, plus ECC error counts and driver error events. Progress lines already show temperature, power, clock and throttling.
 - JSON output for automation.
