@@ -19,17 +19,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::{HardwareErrors, Monitor, Stats};
+use crate::output::{GpuSummary, Output, Record};
 use crate::units::format_duration;
 
 /// How often the supervisor checks the stop flag when nothing else is due.
 const POLL: Duration = Duration::from_millis(200);
-
-/// Writes a line, ignoring errors such as a closed pipe: losing output must
-/// not stop a test that is still running.
-macro_rules! say {
-    ($out:expr) => {{ let _ = writeln!($out); }};
-    ($out:expr, $($arg:tt)*) => {{ let _ = writeln!($out, $($arg)*); }};
-}
 
 /// A GPU to test.
 pub struct Target {
@@ -176,12 +170,13 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    fn label(&self) -> &'static str {
+    /// `pass`, `fail`, `hung` or `error`.
+    fn name(&self) -> &'static str {
         match self {
-            Self::Pass => "PASS",
-            Self::Mismatches { .. } | Self::HardwareErrors(_) | Self::Died(_) => "FAIL",
-            Self::Hung(_) => "HUNG",
-            Self::NotTested(_) => "ERROR",
+            Self::Pass => "pass",
+            Self::Mismatches { .. } | Self::HardwareErrors(_) | Self::Died(_) => "fail",
+            Self::Hung(_) => "hung",
+            Self::NotTested(_) => "error",
         }
     }
 
@@ -298,12 +293,11 @@ impl Gpu {
     }
 
     /// Stops waiting for this GPU and tells its worker to stop if it can.
-    fn give_up(&mut self, reason: String, now: Instant, out: &mut impl Write) {
-        say!(
-            out,
-            "HUNG  gpu {}  {reason}; giving up on it",
-            self.target.ordinal
-        );
+    fn give_up(&mut self, reason: String, now: Instant, out: &mut Output<impl Write>) {
+        out.emit(Record::Hung {
+            gpu: self.target.ordinal,
+            reason: &reason,
+        });
         self.abandoned.store(true, Ordering::SeqCst);
         self.phase = Phase::Hung(reason);
         self.ended_at = Some(now);
@@ -341,7 +335,36 @@ impl Gpu {
         (secs > 0.0).then(|| self.gemms as f64 * self.flops_per_gemm() / secs / 1e12)
     }
 
-    fn apply(&mut self, event: Event, now: Instant, out: &mut impl Write) {
+    fn summary(&self, ended: Instant) -> GpuSummary {
+        let verdict = self.verdict();
+        let tflops_average = self.average_tflops(ended);
+        let detail = match &verdict {
+            Verdict::Pass => match tflops_average {
+                Some(tflops) => format!("{} GEMMs, {tflops:.2} TFLOP/s average", self.gemms),
+                None => format!("{} GEMMs", self.gemms),
+            },
+            Verdict::Mismatches { values, chunks } => {
+                format!("{values} mismatched values in {chunks} chunk(s)")
+            }
+            Verdict::HardwareErrors(errors) => format!("every result matched, but {errors}"),
+            Verdict::Died(error) => format!("failed during the run: {error}"),
+            Verdict::Hung(reason) => reason.clone(),
+            Verdict::NotTested(error) => format!("not tested: {error}"),
+        };
+        GpuSummary {
+            gpu: self.target.ordinal,
+            name: self.target.name.clone(),
+            verdict: verdict.name(),
+            detail,
+            gemms: self.gemms,
+            mismatches: self.mismatches,
+            tflops_average,
+            telemetry: self.stats.summary(),
+            hardware_errors: self.errors.clone(),
+        }
+    }
+
+    fn apply(&mut self, event: Event, now: Instant, out: &mut Output<impl Write>) {
         let ordinal = self.target.ordinal;
         if matches!(self.phase, Phase::Hung(_)) {
             // Given up on: only note when its worker finally returns.
@@ -350,7 +373,10 @@ impl Gpu {
         }
         match event {
             Event::Ready(ready) => {
-                say!(out, "gpu {ordinal}  ready: {}", ready.detail);
+                out.emit(Record::Ready {
+                    gpu: ordinal,
+                    detail: &ready.detail,
+                });
                 self.phase = Phase::Running;
                 self.ready = Some(ready);
                 self.ready_at = Some(now);
@@ -363,7 +389,7 @@ impl Gpu {
                 self.last_progress = now;
                 if self.stalled {
                     self.stalled = false;
-                    say!(out, "gpu {ordinal}  progressing again");
+                    out.emit(Record::Recovered { gpu: ordinal });
                 }
             }
             Event::Mismatch {
@@ -374,11 +400,13 @@ impl Gpu {
             } => {
                 self.mismatches += count;
                 self.bad_chunks += 1;
-                say!(
-                    out,
-                    "MISMATCH  gpu {ordinal}  pass {pass}, results {first}-{last}: \
-                     {count} values differ from the reference"
-                );
+                out.emit(Record::Mismatch {
+                    gpu: ordinal,
+                    pass,
+                    first,
+                    last,
+                    count,
+                });
             }
             Event::Finished => {
                 self.phase = Phase::Finished;
@@ -386,12 +414,11 @@ impl Gpu {
                 self.exited = true;
             }
             Event::Failed(error) => {
-                let when = if self.ready_at.is_some() {
-                    "failed during the run"
-                } else {
-                    "could not start"
-                };
-                say!(out, "ERROR  gpu {ordinal}  {when}: {error}");
+                out.emit(Record::Error {
+                    gpu: ordinal,
+                    during_run: self.ready_at.is_some(),
+                    message: &error,
+                });
                 self.phase = Phase::Failed(error);
                 self.ended_at = Some(now);
                 self.exited = true;
@@ -415,19 +442,17 @@ pub fn supervise(
     config: &Config,
     stop: Arc<AtomicBool>,
     monitor: &dyn Monitor,
-    out: &mut impl Write,
+    out: &mut Output<impl Write>,
 ) -> Summary {
     let launched = Instant::now();
     let (tx, rx) = mpsc::channel();
     let mut gpus = Vec::with_capacity(workers.len());
     for (index, (target, work)) in workers.into_iter().enumerate() {
-        say!(
-            out,
-            "gpu {}  {}  ({})",
-            target.ordinal,
-            target.name,
-            target.detail
-        );
+        out.emit(Record::Gpu {
+            gpu: target.ordinal,
+            name: &target.name,
+            detail: &target.detail,
+        });
         let abandoned = Arc::new(AtomicBool::new(false));
         let mut gpu = Gpu::new(target, launched, abandoned.clone());
         let reporter = Reporter {
@@ -456,16 +481,25 @@ pub fn supervise(
     wait_for_workers(&mut gpus, &rx, config, ended, out);
     reap(&mut gpus, &rx, config.reap_grace, out);
     check_hardware(&mut gpus, monitor, out);
-    print_summary(
-        &gpus,
-        clock.map_or(Duration::ZERO, |start| ended - start),
-        ended,
-        out,
-    );
 
-    Summary {
+    let summary = Summary {
         verdicts: gpus.iter().map(Gpu::verdict).collect(),
-    }
+    };
+    let exit_status = summary.exit_status();
+    let gpu_summaries: Vec<GpuSummary> = gpus.iter().map(|gpu| gpu.summary(ended)).collect();
+    out.emit(Record::Summary {
+        elapsed_secs: clock
+            .map_or(Duration::ZERO, |start| ended - start)
+            .as_secs_f64(),
+        result: match exit_status {
+            0 => "pass",
+            1 => "fail",
+            _ => "error",
+        },
+        exit_status,
+        gpus: &gpu_summaries,
+    });
+    summary
 }
 
 /// Runs a worker, turning errors and panics into events.
@@ -496,7 +530,7 @@ fn run_until_done(
     launched: Instant,
     stop: &AtomicBool,
     monitor: &dyn Monitor,
-    out: &mut impl Write,
+    out: &mut Output<impl Write>,
 ) -> Option<Instant> {
     let mut clock: Option<(Instant, Instant)> = None;
     let mut next_report = None;
@@ -522,7 +556,9 @@ fn run_until_done(
             clock = Some((now, now + config.duration));
             next_report = Some(now + config.report_every);
             if gpus.iter().any(|gpu| matches!(gpu.phase, Phase::Running)) {
-                say!(out, "running for {}", format_duration(config.duration));
+                out.emit(Record::Running {
+                    duration_secs: config.duration.as_secs_f64(),
+                });
             }
         }
         if gpus.iter().all(Gpu::is_done) || stop.load(Ordering::SeqCst) {
@@ -550,50 +586,52 @@ fn report(
     start: Instant,
     now: Instant,
     monitor: &dyn Monitor,
-    out: &mut impl Write,
+    out: &mut Output<impl Write>,
 ) {
     for (index, gpu) in gpus.iter_mut().enumerate() {
         if !matches!(gpu.phase, Phase::Running) {
             continue;
         }
         let secs = (gpu.last_progress - gpu.reported_at).as_secs_f64();
-        let rate = if secs > 0.0 {
-            let tflops =
-                (gpu.gemms - gpu.reported_gemms) as f64 * gpu.flops_per_gemm() / secs / 1e12;
-            format!("{tflops:>8.2}")
-        } else {
-            format!("{:>8}", "--")
-        };
+        let tflops = (secs > 0.0)
+            .then(|| (gpu.gemms - gpu.reported_gemms) as f64 * gpu.flops_per_gemm() / secs / 1e12);
         let reading = monitor.reading(index);
         if let Some(reading) = &reading {
             gpu.stats.add(reading);
         }
-        let line = format!(
-            "{:>8}  gpu {:<2} pass {:<4} {rate} TFLOP/s  mismatches {:<6} {}",
-            format_duration(now - start),
-            gpu.target.ordinal,
-            gpu.pass,
-            gpu.mismatches,
-            reading.map(|r| r.to_string()).unwrap_or_default()
-        );
-        say!(out, "{}", line.trim_end());
+        out.emit(Record::Progress {
+            elapsed_secs: (now - start).as_secs_f64(),
+            gpu: gpu.target.ordinal,
+            pass: gpu.pass,
+            tflops,
+            mismatches: gpu.mismatches,
+            reading: reading.as_ref(),
+        });
         gpu.reported_gemms = gpu.gemms;
         gpu.reported_at = gpu.last_progress;
     }
 }
 
 /// Reports hardware errors as they appear.
-fn check_hardware(gpus: &mut [Gpu], monitor: &dyn Monitor, out: &mut impl Write) {
+fn check_hardware(gpus: &mut [Gpu], monitor: &dyn Monitor, out: &mut Output<impl Write>) {
     for (index, gpu) in gpus.iter_mut().enumerate() {
         let errors = monitor.errors(index);
         for change in errors.changes_since(&gpu.errors) {
-            say!(out, "HARDWARE  gpu {}  {change}", gpu.target.ordinal);
+            out.emit(Record::Hardware {
+                gpu: gpu.target.ordinal,
+                message: &change,
+            });
         }
         gpu.errors = errors;
     }
 }
 
-fn warn_about_stalls(gpus: &mut [Gpu], config: &Config, now: Instant, out: &mut impl Write) {
+fn warn_about_stalls(
+    gpus: &mut [Gpu],
+    config: &Config,
+    now: Instant,
+    out: &mut Output<impl Write>,
+) {
     for gpu in gpus.iter_mut() {
         let Some(ready) = &gpu.ready else { continue };
         if gpu.stalled || !matches!(gpu.phase, Phase::Running) {
@@ -605,18 +643,16 @@ fn warn_about_stalls(gpus: &mut [Gpu], config: &Config, now: Instant, out: &mut 
         let quiet = now - gpu.last_progress;
         if quiet > threshold {
             gpu.stalled = true;
-            say!(
-                out,
-                "WARNING  gpu {}  no progress for {}",
-                gpu.target.ordinal,
-                format_duration(quiet)
-            );
+            out.emit(Record::Stalled {
+                gpu: gpu.target.ordinal,
+                quiet_secs: quiet.as_secs_f64(),
+            });
         }
     }
 }
 
 /// Gives up on running GPUs that have made no progress for too long.
-fn give_up_on_hung(gpus: &mut [Gpu], config: &Config, now: Instant, out: &mut impl Write) {
+fn give_up_on_hung(gpus: &mut [Gpu], config: &Config, now: Instant, out: &mut Output<impl Write>) {
     for gpu in gpus.iter_mut() {
         let chunk_secs = match (&gpu.phase, &gpu.ready) {
             (Phase::Running, Some(ready)) => ready.chunk_secs,
@@ -643,7 +679,7 @@ fn wait_for_workers(
     rx: &Receiver<Message>,
     config: &Config,
     ended: Instant,
-    out: &mut impl Write,
+    out: &mut Output<impl Write>,
 ) {
     let slowest_chunk = gpus
         .iter()
@@ -675,7 +711,7 @@ fn wait_for_workers(
 
 /// Waits briefly for workers that were given up on to exit, so that child
 /// processes are killed and collected before burnin exits.
-fn reap(gpus: &mut [Gpu], rx: &Receiver<Message>, grace: Duration, out: &mut impl Write) {
+fn reap(gpus: &mut [Gpu], rx: &Receiver<Message>, grace: Duration, out: &mut Output<impl Write>) {
     let deadline = Instant::now() + grace;
     while gpus.iter().any(|gpu| !gpu.exited) {
         let now = Instant::now();
@@ -689,67 +725,11 @@ fn reap(gpus: &mut [Gpu], rx: &Receiver<Message>, grace: Duration, out: &mut imp
     }
 }
 
-fn print_summary(gpus: &[Gpu], elapsed: Duration, ended: Instant, out: &mut impl Write) {
-    let name_width = gpus
-        .iter()
-        .map(|gpu| gpu.target.name.len())
-        .max()
-        .unwrap_or(0);
-    say!(out);
-    say!(out, "summary after {}", format_duration(elapsed));
-    for gpu in gpus {
-        let verdict = gpu.verdict();
-        let detail = match &verdict {
-            Verdict::Pass => match gpu.average_tflops(ended) {
-                Some(tflops) => format!("{} GEMMs, {tflops:.2} TFLOP/s average", gpu.gemms),
-                None => format!("{} GEMMs", gpu.gemms),
-            },
-            Verdict::Mismatches { values, chunks } => {
-                format!("{values} mismatched values in {chunks} chunk(s)")
-            }
-            Verdict::HardwareErrors(errors) => format!("every result matched, but {errors}"),
-            Verdict::Died(error) => format!("failed during the run: {error}"),
-            Verdict::Hung(reason) => reason.clone(),
-            Verdict::NotTested(error) => format!("not tested: {error}"),
-        };
-        say!(
-            out,
-            "  gpu {:<2} {:<name_width$}  {:<5}  {detail}",
-            gpu.target.ordinal,
-            gpu.target.name,
-            verdict.label()
-        );
-        // Further lines line up under the GPU's name.
-        if let Some(stats) = gpu.stats.summary() {
-            say!(out, "         {stats}");
-        }
-        if gpu.errors.is_monitored() {
-            say!(out, "         {}", gpu.errors.summary());
-        }
-    }
-
-    let total = gpus.len();
-    let failed = gpus.iter().filter(|gpu| gpu.verdict().is_failure()).count();
-    let untested = gpus
-        .iter()
-        .filter(|gpu| matches!(gpu.verdict(), Verdict::NotTested(_)))
-        .count();
-    if failed > 0 {
-        say!(out, "FAIL  {failed} of {total} GPU(s) failed");
-    } else if untested > 0 {
-        say!(
-            out,
-            "ERROR  {untested} of {total} GPU(s) could not be tested"
-        );
-    } else {
-        say!(out, "PASS  all {total} GPU(s) passed");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::monitor::{NoMonitor, Reading};
+    use crate::output::Format;
 
     fn config() -> Config {
         Config {
@@ -808,9 +788,9 @@ mod tests {
         cfg: &Config,
         monitor: &dyn Monitor,
     ) -> (Summary, String) {
-        let mut out = Vec::new();
+        let mut out = Output::new(Format::Human, Vec::new());
         let summary = supervise(workers, cfg, stop, monitor, &mut out);
-        (summary, String::from_utf8(out).unwrap())
+        (summary, String::from_utf8(out.into_inner()).unwrap())
     }
 
     /// Reports the same readings and errors for every GPU.
@@ -1110,6 +1090,38 @@ mod tests {
         let (summary, _) = run(workers, stop, &cfg);
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(verdicts(&summary), vec![Verdict::Pass]);
+    }
+
+    #[test]
+    fn json_output_ends_with_a_summary() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers = vec![
+            (target(0), healthy(&stop, false)),
+            (target(1), healthy(&stop, true)),
+        ];
+        let mut out = Output::new(Format::Json, Vec::new());
+        let summary = supervise(workers, &config(), stop, &NoMonitor, &mut out);
+        let text = String::from_utf8(out.into_inner()).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every line is JSON"))
+            .collect();
+
+        let events: Vec<&str> = records
+            .iter()
+            .map(|r| r["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(&events[..2], ["gpu", "gpu"]);
+        assert!(events.contains(&"ready") && events.contains(&"progress"));
+        assert!(events.contains(&"mismatch"));
+
+        let last = records.last().unwrap();
+        assert_eq!(last["event"], "summary");
+        assert_eq!(last["result"], "fail");
+        assert_eq!(last["exit_status"], summary.exit_status());
+        assert_eq!(last["gpus"][0]["verdict"], "pass");
+        assert_eq!(last["gpus"][1]["verdict"], "fail");
+        assert_eq!(last["gpus"][1]["mismatches"], 3);
     }
 
     #[test]

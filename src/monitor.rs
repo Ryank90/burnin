@@ -4,6 +4,8 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use serde::Serialize;
+
 /// Reads a GPU's sensors and error counters during a run. GPUs are identified
 /// by their index in the run.
 pub trait Monitor {
@@ -27,7 +29,7 @@ impl Monitor for NoMonitor {
 }
 
 /// A point-in-time reading. Fields the GPU doesn't report are `None`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Reading {
     pub temperature_c: Option<u32>,
     pub power_w: Option<f64>,
@@ -58,7 +60,7 @@ impl fmt::Display for Reading {
 }
 
 /// Hardware errors reported during a run.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct HardwareErrors {
     /// New corrected ECC memory errors, or `None` when the GPU doesn't report ECC.
     pub ecc_corrected: Option<u64>,
@@ -173,30 +175,55 @@ impl Stats {
         self.throttle.extend(reading.throttle.iter().cloned());
     }
 
-    /// One line for the summary, or `None` when nothing was read.
-    pub fn summary(&self) -> Option<String> {
+    /// The run's telemetry so far, or `None` when nothing was read.
+    pub fn summary(&self) -> Option<TelemetrySummary> {
+        let power = (self.power_samples > 0).then(|| {
+            (
+                self.power_total / f64::from(self.power_samples),
+                self.power_max,
+            )
+        });
+        let summary = TelemetrySummary {
+            temperature_max_c: self.temperature_max,
+            power_average_w: power.map(|(average, _)| average),
+            power_max_w: power.map(|(_, max)| max),
+            sm_clock_average_mhz: (self.clock_samples > 0)
+                .then(|| self.clock_total / u64::from(self.clock_samples)),
+            sm_clock_min_mhz: self.clock_min,
+            throttle_reasons: self.throttle.iter().cloned().collect(),
+        };
+        (summary != TelemetrySummary::default()).then_some(summary)
+    }
+}
+
+/// Telemetry over a whole run. Fields the GPU didn't report are `None`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct TelemetrySummary {
+    pub temperature_max_c: Option<u32>,
+    pub power_average_w: Option<f64>,
+    pub power_max_w: Option<f64>,
+    pub sm_clock_average_mhz: Option<u64>,
+    pub sm_clock_min_mhz: Option<u32>,
+    /// Every reason the GPU ran below its maximum clocks, at any reading.
+    pub throttle_reasons: Vec<String>,
+}
+
+impl fmt::Display for TelemetrySummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts = Vec::new();
-        if let Some(max) = self.temperature_max {
+        if let Some(max) = self.temperature_max_c {
             parts.push(format!("{max} C peak"));
         }
-        if self.power_samples > 0 {
-            parts.push(format!(
-                "{:.0} W average, {:.0} W peak",
-                self.power_total / f64::from(self.power_samples),
-                self.power_max
-            ));
+        if let (Some(average), Some(max)) = (self.power_average_w, self.power_max_w) {
+            parts.push(format!("{average:.0} W average, {max:.0} W peak"));
         }
-        if let Some(min) = self.clock_min {
-            parts.push(format!(
-                "{} MHz average, {min} MHz lowest",
-                self.clock_total / u64::from(self.clock_samples)
-            ));
+        if let (Some(average), Some(min)) = (self.sm_clock_average_mhz, self.sm_clock_min_mhz) {
+            parts.push(format!("{average} MHz average, {min} MHz lowest"));
         }
-        if !self.throttle.is_empty() {
-            let reasons: Vec<&str> = self.throttle.iter().map(String::as_str).collect();
-            parts.push(format!("throttled: {}", reasons.join(", ")));
+        if !self.throttle_reasons.is_empty() {
+            parts.push(format!("throttled: {}", self.throttle_reasons.join(", ")));
         }
-        (!parts.is_empty()).then(|| parts.join("; "))
+        write!(f, "{}", parts.join("; "))
     }
 }
 
@@ -235,7 +262,7 @@ mod tests {
         stats.add(&reading(71, 700.0, 1700, &["sw-power-cap"]));
         stats.add(&Reading::default());
         assert_eq!(
-            stats.summary().unwrap(),
+            stats.summary().unwrap().to_string(),
             "71 C peak; 650 W average, 700 W peak; 1800 MHz average, 1700 MHz lowest; \
              throttled: sw-power-cap"
         );

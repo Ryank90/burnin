@@ -12,6 +12,7 @@ use cudarc::driver::sys::{CUdevice, CUdevice_attribute as Attr};
 use cudarc::driver::{CudaContext, result as driver};
 
 use crate::mem::{self, HostMemory, MemSpec};
+use crate::output::{Output, Record};
 use crate::supervisor::{self, Config, Target, Work};
 use crate::telemetry::{self, Telemetry};
 use crate::units::format_bytes;
@@ -301,12 +302,12 @@ pub fn run(args: &RunArgs) -> Result<u8> {
     let stop = Arc::new(AtomicBool::new(false));
     install_stop_handler(stop.clone())?;
 
-    println!(
-        "testing {} {} with {}; Ctrl-C stops early",
-        infos.len(),
-        if infos.len() == 1 { "GPU" } else { "GPUs" },
-        args.precision.name()
-    );
+    let mut out = Output::new(args.format, std::io::stdout().lock());
+    out.emit(Record::Start {
+        version: env!("CARGO_PKG_VERSION"),
+        precision: args.precision.name(),
+        gpus: infos.len(),
+    });
     let workers = infos
         .into_iter()
         .map(|info| {
@@ -341,13 +342,7 @@ pub fn run(args: &RunArgs) -> Result<u8> {
         reap_grace: REAP_GRACE,
     };
     let summary = telemetry::watch(telemetry.as_ref(), &pci_bus_ids, |monitor| {
-        supervisor::supervise(
-            workers,
-            &config,
-            stop,
-            monitor,
-            &mut std::io::stdout().lock(),
-        )
+        supervisor::supervise(workers, &config, stop, monitor, &mut out)
     });
     Ok(summary.exit_status())
 }
