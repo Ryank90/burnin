@@ -6,6 +6,7 @@
 
 mod isolation;
 mod mem;
+mod monitor;
 mod supervisor;
 mod units;
 

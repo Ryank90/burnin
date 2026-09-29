@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::monitor::{HardwareErrors, Monitor, Stats};
 use crate::units::format_duration;
 
 /// How often the supervisor checks the stop flag when nothing else is due.
@@ -163,6 +164,9 @@ pub enum Verdict {
         values: u64,
         chunks: u64,
     },
+    /// Every result matched, but the GPU reported uncorrected memory errors
+    /// or critical driver errors.
+    HardwareErrors(String),
     /// Failed with an error after testing began.
     Died(String),
     /// Stopped making progress, or did not stop when the run ended.
@@ -175,7 +179,7 @@ impl Verdict {
     fn label(&self) -> &'static str {
         match self {
             Self::Pass => "PASS",
-            Self::Mismatches { .. } | Self::Died(_) => "FAIL",
+            Self::Mismatches { .. } | Self::HardwareErrors(_) | Self::Died(_) => "FAIL",
             Self::Hung(_) => "HUNG",
             Self::NotTested(_) => "ERROR",
         }
@@ -184,7 +188,7 @@ impl Verdict {
     fn is_failure(&self) -> bool {
         matches!(
             self,
-            Self::Mismatches { .. } | Self::Died(_) | Self::Hung(_)
+            Self::Mismatches { .. } | Self::HardwareErrors(_) | Self::Died(_) | Self::Hung(_)
         )
     }
 }
@@ -258,6 +262,9 @@ struct Gpu {
     abandoned: Arc<AtomicBool>,
     /// The worker has returned, even if it was given up on first.
     exited: bool,
+    stats: Stats,
+    /// Hardware errors as of the last check.
+    errors: HardwareErrors,
 }
 
 impl Gpu {
@@ -278,6 +285,8 @@ impl Gpu {
             stalled: false,
             abandoned,
             exited: false,
+            stats: Stats::default(),
+            errors: HardwareErrors::default(),
         }
     }
 
@@ -316,6 +325,9 @@ impl Gpu {
                 values: self.mismatches,
                 chunks: self.bad_chunks,
             },
+            Phase::Finished if self.errors.is_failure() => {
+                Verdict::HardwareErrors(self.errors.failure())
+            }
             Phase::Finished if self.gemms == 0 => {
                 Verdict::NotTested("stopped before testing began".to_string())
             }
@@ -402,7 +414,7 @@ pub fn supervise(
     workers: Vec<(Target, Work)>,
     config: &Config,
     stop: Arc<AtomicBool>,
-    sample: impl Fn(usize) -> Option<String>,
+    monitor: &dyn Monitor,
     out: &mut impl Write,
 ) -> Summary {
     let launched = Instant::now();
@@ -438,11 +450,12 @@ pub fn supervise(
     // Only workers hold senders now, so the channel disconnects once they have all ended.
     drop(tx);
 
-    let clock = run_until_done(&mut gpus, &rx, config, launched, &stop, &sample, out);
+    let clock = run_until_done(&mut gpus, &rx, config, launched, &stop, monitor, out);
     stop.store(true, Ordering::SeqCst);
     let ended = Instant::now();
     wait_for_workers(&mut gpus, &rx, config, ended, out);
     reap(&mut gpus, &rx, config.reap_grace, out);
+    check_hardware(&mut gpus, monitor, out);
     print_summary(
         &gpus,
         clock.map_or(Duration::ZERO, |start| ended - start),
@@ -482,7 +495,7 @@ fn run_until_done(
     config: &Config,
     launched: Instant,
     stop: &AtomicBool,
-    sample: &impl Fn(usize) -> Option<String>,
+    monitor: &dyn Monitor,
     out: &mut impl Write,
 ) -> Option<Instant> {
     let mut clock: Option<(Instant, Instant)> = None;
@@ -522,7 +535,8 @@ fn run_until_done(
             break;
         }
         if next_report.is_some_and(|at| now >= at) {
-            report(gpus, start, now, sample, out);
+            report(gpus, start, now, monitor, out);
+            check_hardware(gpus, monitor, out);
             next_report = Some(now + config.report_every);
         }
         warn_about_stalls(gpus, config, now, out);
@@ -535,7 +549,7 @@ fn report(
     gpus: &mut [Gpu],
     start: Instant,
     now: Instant,
-    sample: &impl Fn(usize) -> Option<String>,
+    monitor: &dyn Monitor,
     out: &mut impl Write,
 ) {
     for (index, gpu) in gpus.iter_mut().enumerate() {
@@ -550,17 +564,32 @@ fn report(
         } else {
             format!("{:>8}", "--")
         };
+        let reading = monitor.reading(index);
+        if let Some(reading) = &reading {
+            gpu.stats.add(reading);
+        }
         let line = format!(
             "{:>8}  gpu {:<2} pass {:<4} {rate} TFLOP/s  mismatches {:<6} {}",
             format_duration(now - start),
             gpu.target.ordinal,
             gpu.pass,
             gpu.mismatches,
-            sample(index).unwrap_or_default()
+            reading.map(|r| r.to_string()).unwrap_or_default()
         );
         say!(out, "{}", line.trim_end());
         gpu.reported_gemms = gpu.gemms;
         gpu.reported_at = gpu.last_progress;
+    }
+}
+
+/// Reports hardware errors as they appear.
+fn check_hardware(gpus: &mut [Gpu], monitor: &dyn Monitor, out: &mut impl Write) {
+    for (index, gpu) in gpus.iter_mut().enumerate() {
+        let errors = monitor.errors(index);
+        for change in errors.changes_since(&gpu.errors) {
+            say!(out, "HARDWARE  gpu {}  {change}", gpu.target.ordinal);
+        }
+        gpu.errors = errors;
     }
 }
 
@@ -678,6 +707,7 @@ fn print_summary(gpus: &[Gpu], elapsed: Duration, ended: Instant, out: &mut impl
             Verdict::Mismatches { values, chunks } => {
                 format!("{values} mismatched values in {chunks} chunk(s)")
             }
+            Verdict::HardwareErrors(errors) => format!("every result matched, but {errors}"),
             Verdict::Died(error) => format!("failed during the run: {error}"),
             Verdict::Hung(reason) => reason.clone(),
             Verdict::NotTested(error) => format!("not tested: {error}"),
@@ -689,6 +719,13 @@ fn print_summary(gpus: &[Gpu], elapsed: Duration, ended: Instant, out: &mut impl
             gpu.target.name,
             verdict.label()
         );
+        // Further lines line up under the GPU's name.
+        if let Some(stats) = gpu.stats.summary() {
+            say!(out, "         {stats}");
+        }
+        if gpu.errors.is_monitored() {
+            say!(out, "         {}", gpu.errors.summary());
+        }
     }
 
     let total = gpus.len();
@@ -712,6 +749,7 @@ fn print_summary(gpus: &[Gpu], elapsed: Duration, ended: Instant, out: &mut impl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::{NoMonitor, Reading};
 
     fn config() -> Config {
         Config {
@@ -761,9 +799,110 @@ mod tests {
     }
 
     fn run(workers: Vec<(Target, Work)>, stop: Arc<AtomicBool>, cfg: &Config) -> (Summary, String) {
+        run_with(workers, stop, cfg, &NoMonitor)
+    }
+
+    fn run_with(
+        workers: Vec<(Target, Work)>,
+        stop: Arc<AtomicBool>,
+        cfg: &Config,
+        monitor: &dyn Monitor,
+    ) -> (Summary, String) {
         let mut out = Vec::new();
-        let summary = supervise(workers, cfg, stop, |_| None, &mut out);
+        let summary = supervise(workers, cfg, stop, monitor, &mut out);
         (summary, String::from_utf8(out).unwrap())
+    }
+
+    /// Reports the same readings and errors for every GPU.
+    struct FakeMonitor {
+        reading: Reading,
+        errors: HardwareErrors,
+    }
+
+    impl Monitor for FakeMonitor {
+        fn reading(&self, _gpu: usize) -> Option<Reading> {
+            Some(self.reading.clone())
+        }
+
+        fn errors(&self, _gpu: usize) -> HardwareErrors {
+            self.errors.clone()
+        }
+    }
+
+    fn healthy_readings(errors: HardwareErrors) -> FakeMonitor {
+        FakeMonitor {
+            reading: Reading {
+                temperature_c: Some(70),
+                power_w: Some(300.0),
+                sm_clock_mhz: Some(1800),
+                throttle: vec!["sw-power-cap".to_string()],
+            },
+            errors,
+        }
+    }
+
+    #[test]
+    fn telemetry_appears_in_progress_and_summary() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers = vec![(target(0), healthy(&stop, false))];
+        let monitor = healthy_readings(HardwareErrors {
+            ecc_corrected: Some(0),
+            ecc_uncorrected: Some(0),
+            xids: Some(vec![]),
+        });
+        let (summary, out) = run_with(workers, stop, &config(), &monitor);
+        assert_eq!(verdicts(&summary), vec![Verdict::Pass]);
+        assert!(
+            out.contains(" 70 C    300 W  1800 MHz  throttled: sw-power-cap"),
+            "{out}"
+        );
+        assert!(
+            out.contains("70 C peak; 300 W average, 300 W peak"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ECC 0 corrected, 0 uncorrected; no driver errors"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_driver_error_fails_a_gpu_whose_results_matched() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers = vec![(target(0), healthy(&stop, false))];
+        let monitor = healthy_readings(HardwareErrors {
+            ecc_corrected: Some(0),
+            ecc_uncorrected: Some(0),
+            xids: Some(vec![79]),
+        });
+        let (summary, out) = run_with(workers, stop, &config(), &monitor);
+        assert_eq!(
+            verdicts(&summary),
+            vec![Verdict::HardwareErrors("Xid 79 from the driver".into())]
+        );
+        assert_eq!(summary.exit_status(), 1);
+        assert!(
+            out.contains("HARDWARE  gpu 0  the driver reported critical error Xid 79"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn corrected_memory_errors_are_reported_but_pass() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers = vec![(target(0), healthy(&stop, false))];
+        let monitor = healthy_readings(HardwareErrors {
+            ecc_corrected: Some(5),
+            ecc_uncorrected: Some(0),
+            xids: Some(vec![]),
+        });
+        let (summary, out) = run_with(workers, stop, &config(), &monitor);
+        assert_eq!(verdicts(&summary), vec![Verdict::Pass]);
+        assert!(
+            out.contains("HARDWARE  gpu 0  5 new corrected ECC errors"),
+            "{out}"
+        );
+        assert!(out.contains("ECC 5 corrected, 0 uncorrected"), "{out}");
     }
 
     fn verdicts(summary: &Summary) -> Vec<Verdict> {
