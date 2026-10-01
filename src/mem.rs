@@ -8,8 +8,14 @@ use crate::units::format_bytes;
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
-/// Default share of usable memory a run takes.
-pub const DEFAULT_PERCENT: f64 = 90.0;
+/// Default share of usable memory a run takes. A Mac is often a laptop in use
+/// while it is tested, and macOS counts the memory apps are using as available,
+/// so there a run takes half.
+pub const DEFAULT_PERCENT: f64 = if cfg!(target_os = "macos") {
+    50.0
+} else {
+    90.0
+};
 
 /// How much memory the user asked for.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -74,7 +80,7 @@ impl fmt::Display for MemSpec {
     }
 }
 
-/// The parts of `/proc/meminfo` that matter for unified-memory GPUs, in bytes.
+/// The system memory figures that matter for unified-memory GPUs, in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostMemory {
     pub total: u64,
@@ -84,6 +90,7 @@ pub struct HostMemory {
 
 impl HostMemory {
     /// Parses the text of `/proc/meminfo`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn parse(meminfo: &str) -> Option<Self> {
         let (mut total, mut free, mut available) = (None, None, None);
         for line in meminfo.lines() {
@@ -115,9 +122,55 @@ impl HostMemory {
         Self::parse(&text).ok_or_else(|| std::io::Error::other("unexpected /proc/meminfo format"))
     }
 
+    /// Reads the kernel's memory figures. macOS keeps RAM full of cache and
+    /// makes room for new memory by dropping cache and compressing idle pages,
+    /// so memory counts as available unless it is wired or already compressed.
+    /// That is the share `memory_pressure` reports as free.
+    #[cfg(target_os = "macos")]
+    pub fn read() -> std::io::Result<Self> {
+        let total = sysctl_number(c"hw.memsize")?;
+        let page_size = sysctl_number(c"hw.pagesize")?;
+        let free_pages = sysctl_number(c"vm.page_free_count")?;
+        let available_percent = sysctl_number(c"kern.memorystatus_level")?.min(100);
+        Ok(Self {
+            total,
+            free: free_pages * page_size,
+            available: total / 100 * available_percent,
+        })
+    }
+
     /// Memory left for the OS when the GPU shares system RAM: 10% of RAM, and at least 2 GiB.
     pub fn os_reserve(&self) -> u64 {
         (self.total / 10).max(2 * GIB)
+    }
+}
+
+/// Reads a numeric sysctl, which the kernel stores in 4 or 8 bytes.
+#[cfg(target_os = "macos")]
+fn sysctl_number(name: &std::ffi::CStr) -> std::io::Result<u64> {
+    let mut value = [0u8; 8];
+    let mut len = value.len();
+    // SAFETY: `name` is NUL-terminated, and the kernel writes at most `len`
+    // bytes into `value`, then stores how many it wrote in `len`.
+    let status = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    match len {
+        4 => Ok(u32::from_ne_bytes([value[0], value[1], value[2], value[3]]).into()),
+        8 => Ok(u64::from_ne_bytes(value)),
+        _ => Err(std::io::Error::other(format!(
+            "unexpected size for sysctl {}",
+            name.to_string_lossy()
+        ))),
     }
 }
 
@@ -127,7 +180,12 @@ pub enum Basis {
     /// The user asked for an exact size.
     Explicit,
     /// The free memory the GPU reports.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     DeviceFree { free: u64 },
+    /// The working set Metal recommends for the GPU, less what this process
+    /// already has allocated on it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    WorkingSet { recommended: u64, in_use: u64 },
     /// Available system RAM minus a reserve for the OS, split between the
     /// unified-memory GPUs under test.
     HostAvailable {
@@ -150,6 +208,7 @@ pub struct Budget {
 /// usable, or close to all of the machine's RAM. For those GPUs the budget comes
 /// from `MemAvailable` minus a reserve for the OS instead, split evenly between
 /// the `host_sharers` unified-memory GPUs being tested at once.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn budget(
     spec: MemSpec,
     device_free: u64,
@@ -182,9 +241,60 @@ pub fn budget(
         _ => (device_free, Basis::DeviceFree { free: device_free }),
     };
     Budget {
-        bytes: (base as f64 * percent / 100.0) as u64,
+        bytes: percent_of(base, percent),
         basis,
     }
+}
+
+/// Picks how many bytes a run may allocate on a Metal device.
+///
+/// Metal recommends a working set for each GPU: roughly the most memory it can
+/// use before performance suffers. The budget comes from what is left of that
+/// after `in_use`, the memory this process already has on the device. A GPU
+/// that shares system RAM is also held to the available system memory less a
+/// reserve for the OS, so that a busy Mac is not pushed into swap. Whichever
+/// is smaller becomes the basis.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn working_set_budget(
+    spec: MemSpec,
+    recommended: u64,
+    in_use: u64,
+    host: Option<HostMemory>,
+) -> Budget {
+    let percent = match spec {
+        MemSpec::Bytes(bytes) => {
+            return Budget {
+                bytes,
+                basis: Basis::Explicit,
+            };
+        }
+        MemSpec::Percent(percent) => percent,
+    };
+    let mut base = recommended.saturating_sub(in_use);
+    let mut basis = Basis::WorkingSet {
+        recommended,
+        in_use,
+    };
+    if let Some(host) = host {
+        let reserve = host.os_reserve();
+        let usable = host.available.saturating_sub(reserve);
+        if usable < base {
+            base = usable;
+            basis = Basis::HostAvailable {
+                available: host.available,
+                reserve,
+                shared_by: 1,
+            };
+        }
+    }
+    Budget {
+        bytes: percent_of(base, percent),
+        basis,
+    }
+}
+
+fn percent_of(bytes: u64, percent: f64) -> u64 {
+    (bytes as f64 * percent / 100.0) as u64
 }
 
 /// Describes how a budget was reached, for example `90% of 79.2 GiB free on the device`.
@@ -193,6 +303,23 @@ pub fn describe(spec: MemSpec, budget: &Budget) -> String {
         (_, Basis::Explicit) => "as requested".to_string(),
         (MemSpec::Percent(percent), Basis::DeviceFree { free }) => {
             format!("{percent}% of {} free on the device", format_bytes(free))
+        }
+        (
+            MemSpec::Percent(percent),
+            Basis::WorkingSet {
+                recommended,
+                in_use,
+            },
+        ) => {
+            let in_use = if in_use >= MIB {
+                format!(", less {} already in use", format_bytes(in_use))
+            } else {
+                String::new()
+            };
+            format!(
+                "{percent}% of the {} recommended working set{in_use}",
+                format_bytes(recommended)
+            )
         }
         (
             MemSpec::Percent(percent),
@@ -313,6 +440,84 @@ Cached:          61203412 kB
             available: 0,
         };
         assert_eq!(small.os_reserve(), 2 * GIB);
+    }
+
+    #[test]
+    fn metal_gpu_uses_what_is_left_of_the_working_set() {
+        let b = working_set_budget(MemSpec::Percent(50.0), 12 * GIB, 2 * GIB, None);
+        assert_eq!(b.bytes, 5 * GIB);
+        assert_eq!(
+            b.basis,
+            Basis::WorkingSet {
+                recommended: 12 * GIB,
+                in_use: 2 * GIB
+            }
+        );
+        assert_eq!(
+            describe(MemSpec::Percent(50.0), &b),
+            "50% of the 12.0 GiB recommended working set, less 2.0 GiB already in use"
+        );
+        let idle = working_set_budget(MemSpec::Percent(90.0), 12 * GIB, 0, None);
+        assert_eq!(
+            describe(MemSpec::Percent(90.0), &idle),
+            "90% of the 12.0 GiB recommended working set"
+        );
+    }
+
+    #[test]
+    fn busy_mac_is_held_to_available_memory() {
+        let host = HostMemory {
+            total: 16 * GIB,
+            free: 0,
+            available: 6 * GIB,
+        };
+        let b = working_set_budget(MemSpec::Percent(100.0), 12 * GIB, 0, Some(host));
+        assert_eq!(b.bytes, 4 * GIB);
+        assert_eq!(
+            b.basis,
+            Basis::HostAvailable {
+                available: 6 * GIB,
+                reserve: 2 * GIB,
+                shared_by: 1
+            }
+        );
+        // Less busy, the working set is the smaller limit again.
+        let idle = HostMemory {
+            available: 15 * GIB,
+            ..host
+        };
+        let b = working_set_budget(MemSpec::Percent(100.0), 12 * GIB, 0, Some(idle));
+        assert_eq!(b.bytes, 12 * GIB);
+        // Nothing to spare leaves nothing to take.
+        let full = HostMemory {
+            available: GIB,
+            ..host
+        };
+        assert_eq!(
+            working_set_budget(MemSpec::Percent(100.0), 12 * GIB, 0, Some(full)).bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn explicit_size_wins_on_metal() {
+        let b = working_set_budget(MemSpec::Bytes(3 * GIB), 12 * GIB, 0, None);
+        assert_eq!(
+            b,
+            Budget {
+                bytes: 3 * GIB,
+                basis: Basis::Explicit
+            }
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reads_host_memory_on_macos() {
+        let host = HostMemory::read().unwrap();
+        assert!(host.total >= GIB);
+        assert!(host.free <= host.total);
+        assert!(host.available <= host.total);
     }
 
     #[test]

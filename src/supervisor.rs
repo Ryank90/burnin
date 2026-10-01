@@ -1,21 +1,22 @@
 //! Runs one worker thread per GPU, collects what they report, prints progress
 //! and decides a verdict for each GPU.
 //!
-//! The supervisor knows nothing about CUDA. A worker is any closure that
-//! reports through a [`Reporter`] and returns once the shared stop flag is set,
-//! so scheduling, reporting and failure handling can be tested without a GPU.
-//! A worker thread may itself relay events from a child process; see
+//! The supervisor knows nothing about CUDA or Metal. A worker is any closure
+//! that reports through a [`Reporter`] and returns once the shared stop flag is
+//! set, so scheduling, reporting and failure handling can be tested without a
+//! GPU. A worker thread may itself relay events from a child process; see
 //! [`crate::isolation`].
 
 use std::any::Any;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::{HardwareErrors, Monitor, Stats};
@@ -500,6 +501,21 @@ pub fn supervise(
         gpus: &gpu_summaries,
     });
     summary
+}
+
+/// The first Ctrl-C (or SIGTERM) lets every GPU finish its current chunk and
+/// prints the summary; a second one exits immediately.
+pub fn install_stop_handler(stop: Arc<AtomicBool>) -> anyhow::Result<()> {
+    let presses = AtomicUsize::new(0);
+    ctrlc::set_handler(move || {
+        if presses.fetch_add(1, Ordering::SeqCst) == 0 {
+            eprintln!("\nstopping after the current chunk; press Ctrl-C again to quit now");
+            stop.store(true, Ordering::SeqCst);
+        } else {
+            std::process::exit(130);
+        }
+    })
+    .context("could not install the Ctrl-C handler")
 }
 
 /// Runs a worker, turning errors and panics into events.
