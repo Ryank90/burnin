@@ -128,8 +128,13 @@ pub enum Basis {
     Explicit,
     /// The free memory the GPU reports.
     DeviceFree { free: u64 },
-    /// Available system RAM minus a reserve for the OS (unified-memory GPUs).
-    HostAvailable { available: u64, reserve: u64 },
+    /// Available system RAM minus a reserve for the OS, split between the
+    /// unified-memory GPUs under test.
+    HostAvailable {
+        available: u64,
+        reserve: u64,
+        shared_by: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,12 +148,14 @@ pub struct Budget {
 /// A unified-memory GPU reports the kernel's `MemFree` as its free memory. That
 /// ignores reclaimable page cache, so it can be far below what is really
 /// usable, or close to all of the machine's RAM. For those GPUs the budget comes
-/// from `MemAvailable` minus a reserve for the OS instead.
+/// from `MemAvailable` minus a reserve for the OS instead, split evenly between
+/// the `host_sharers` unified-memory GPUs being tested at once.
 pub fn budget(
     spec: MemSpec,
     device_free: u64,
     integrated: bool,
     host: Option<HostMemory>,
+    host_sharers: u64,
 ) -> Budget {
     let percent = match spec {
         MemSpec::Bytes(bytes) => {
@@ -162,11 +169,13 @@ pub fn budget(
     let (base, basis) = match host {
         Some(host) if integrated => {
             let reserve = host.os_reserve();
+            let shared_by = host_sharers.max(1);
             (
-                host.available.saturating_sub(reserve),
+                host.available.saturating_sub(reserve) / shared_by,
                 Basis::HostAvailable {
                     available: host.available,
                     reserve,
+                    shared_by,
                 },
             )
         }
@@ -185,18 +194,33 @@ pub fn describe(spec: MemSpec, budget: &Budget) -> String {
         (MemSpec::Percent(percent), Basis::DeviceFree { free }) => {
             format!("{percent}% of {} free on the device", format_bytes(free))
         }
-        (MemSpec::Percent(percent), Basis::HostAvailable { available, reserve }) => format!(
-            "{percent}% of {} available system memory, less a {} reserve for the OS",
-            format_bytes(available),
-            format_bytes(reserve)
-        ),
+        (
+            MemSpec::Percent(percent),
+            Basis::HostAvailable {
+                available,
+                reserve,
+                shared_by,
+            },
+        ) => {
+            let split = if shared_by > 1 {
+                format!(", split between {shared_by} GPUs")
+            } else {
+                String::new()
+            };
+            format!(
+                "{percent}% of {} available system memory, less a {} reserve for the OS{split}",
+                format_bytes(available),
+                format_bytes(reserve)
+            )
+        }
         (MemSpec::Bytes(_), _) => unreachable!("an explicit size always has an explicit basis"),
     }
 }
 
-/// Number of result matrices that fit in `budget` alongside the two input matrices.
-pub fn result_slots(budget: u64, matrix_bytes: u64) -> u64 {
-    (budget / matrix_bytes).saturating_sub(2)
+/// Number of result matrices that fit in `budget` alongside the two input
+/// matrices. Inputs can be smaller than results, as with FP8.
+pub fn result_slots(budget: u64, input_bytes: u64, result_bytes: u64) -> u64 {
+    budget.saturating_sub(2 * input_bytes) / result_bytes
 }
 
 #[cfg(test)]
@@ -239,7 +263,7 @@ Cached:          61203412 kB
 
     #[test]
     fn discrete_gpu_uses_device_free_memory() {
-        let b = budget(MemSpec::Percent(50.0), 80 * GIB, false, None);
+        let b = budget(MemSpec::Percent(50.0), 80 * GIB, false, None, 1);
         assert_eq!(b.bytes, 40 * GIB);
         assert_eq!(b.basis, Basis::DeviceFree { free: 80 * GIB });
     }
@@ -248,21 +272,30 @@ Cached:          61203412 kB
     fn unified_gpu_uses_available_host_memory() {
         let host = HostMemory::parse(MEMINFO).unwrap();
         // The device reports only ~1.6 GiB free, but ~62 GiB is really available.
-        let b = budget(MemSpec::Percent(100.0), host.free, true, Some(host));
+        let b = budget(MemSpec::Percent(100.0), host.free, true, Some(host), 1);
         assert_eq!(b.bytes, host.available - host.os_reserve());
         assert!(b.bytes > 40 * GIB);
     }
 
     #[test]
+    fn unified_gpus_split_host_memory() {
+        let host = HostMemory::parse(MEMINFO).unwrap();
+        let alone = budget(MemSpec::Percent(100.0), host.free, true, Some(host), 1);
+        let shared = budget(MemSpec::Percent(100.0), host.free, true, Some(host), 2);
+        assert_eq!(shared.bytes, alone.bytes / 2);
+        assert!(describe(MemSpec::Percent(100.0), &shared).ends_with("split between 2 GPUs"));
+    }
+
+    #[test]
     fn unified_gpu_without_meminfo_falls_back_to_device() {
-        let b = budget(MemSpec::Percent(100.0), 8 * GIB, true, None);
+        let b = budget(MemSpec::Percent(100.0), 8 * GIB, true, None, 1);
         assert_eq!(b.basis, Basis::DeviceFree { free: 8 * GIB });
     }
 
     #[test]
     fn explicit_size_wins() {
         let host = HostMemory::parse(MEMINFO).unwrap();
-        let b = budget(MemSpec::Bytes(3 * GIB), 80 * GIB, true, Some(host));
+        let b = budget(MemSpec::Bytes(3 * GIB), 80 * GIB, true, Some(host), 1);
         assert_eq!(
             b,
             Budget {
@@ -285,7 +318,13 @@ Cached:          61203412 kB
     #[test]
     fn counts_result_slots() {
         let matrix = 256 * MIB;
-        assert_eq!(result_slots(10 * GIB, matrix), 38);
-        assert_eq!(result_slots(matrix, matrix), 0);
+        assert_eq!(result_slots(10 * GIB, matrix, matrix), 38);
+        assert_eq!(result_slots(matrix, matrix, matrix), 0);
+    }
+
+    #[test]
+    fn smaller_inputs_leave_room_for_more_results() {
+        // FP8 inputs are a quarter the size of their FP32 results.
+        assert_eq!(result_slots(10 * GIB, 64 * MIB, 256 * MIB), 39);
     }
 }
