@@ -4,7 +4,10 @@
 // code is unused.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+mod isolation;
 mod mem;
+mod monitor;
+mod output;
 mod supervisor;
 mod units;
 
@@ -13,12 +16,14 @@ mod cuda;
 #[cfg(target_os = "linux")]
 mod telemetry;
 
+use std::ffi::OsString;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::mem::MemSpec;
+use crate::output::Format;
 
 /// Default width of the square matrices.
 pub const DEFAULT_MATRIX_SIZE: usize = 8192;
@@ -48,6 +53,9 @@ enum Command {
     },
     /// Stress GPUs in parallel and check that every result they compute matches.
     Run(RunArgs),
+    /// Test one GPU on behalf of a parent `burnin run`, reporting on stdout.
+    #[command(hide = true)]
+    Worker(WorkerArgs),
 }
 
 #[derive(Args, Clone, Debug)]
@@ -93,6 +101,75 @@ pub struct RunArgs {
     /// Corrupt one result on purpose to check that mismatches are detected.
     #[arg(long)]
     pub inject_fault: bool,
+
+    /// Where each GPU is tested: in its own process, so a hung GPU can be
+    /// stopped, or in a thread of this process.
+    #[arg(long, value_enum, default_value_t = Isolation::Process)]
+    pub isolation: Isolation,
+
+    /// Give up on a GPU that makes no progress for this long, and stop its process.
+    #[arg(long, default_value = "3m", value_parser = units::parse_duration)]
+    pub hang_timeout: Duration,
+
+    /// Output format: human-readable text, or JSON Lines ending with a summary object.
+    #[arg(long, value_enum, default_value_t = Format::Human)]
+    pub format: Format,
+}
+
+impl RunArgs {
+    /// Arguments that start a child `burnin worker` testing one GPU with these settings.
+    pub fn worker_args(&self, ordinal: usize, host_sharers: u64) -> Vec<OsString> {
+        let precision = self
+            .precision
+            .to_possible_value()
+            .expect("every precision has a name");
+        let mut args: Vec<OsString> = [
+            "worker".to_string(),
+            "--ordinal".to_string(),
+            ordinal.to_string(),
+            "--host-sharers".to_string(),
+            host_sharers.to_string(),
+            "--precision".to_string(),
+            precision.get_name().to_string(),
+            "--mem".to_string(),
+            self.mem.to_string(),
+            "--matrix-size".to_string(),
+            self.matrix_size.to_string(),
+            "--chunk-secs".to_string(),
+            self.chunk_secs.to_string(),
+            "--tolerance".to_string(),
+            self.tolerance.to_string(),
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        if self.inject_fault {
+            args.push("--inject-fault".into());
+        }
+        args
+    }
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct WorkerArgs {
+    /// CUDA device to test.
+    #[arg(long)]
+    pub ordinal: usize,
+
+    /// Number of unified-memory GPUs sharing host memory in the run.
+    #[arg(long, default_value_t = 1)]
+    pub host_sharers: u64,
+
+    #[command(flatten)]
+    pub run: RunArgs,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Isolation {
+    /// Each GPU in its own process.
+    Process,
+    /// Each GPU in a thread of this process.
+    Thread,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +238,7 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::List => cuda::list().map(|()| ExitCode::SUCCESS),
         Command::Probe { device } => cuda::probe(device).map(|()| ExitCode::SUCCESS),
         Command::Run(args) => cuda::run(&args).map(ExitCode::from),
+        Command::Worker(args) => Ok(cuda::serve_worker(&args)),
     }
 }
 
@@ -190,6 +268,60 @@ mod tests {
         assert_eq!(args.mem, MemSpec::Percent(mem::DEFAULT_PERCENT));
         assert_eq!(args.matrix_size, DEFAULT_MATRIX_SIZE);
         assert!(!args.inject_fault);
+        assert_eq!(args.isolation, Isolation::Process);
+        assert_eq!(args.hang_timeout, Duration::from_secs(180));
+        assert_eq!(args.format, Format::Human);
+    }
+
+    #[test]
+    fn json_format() {
+        assert_eq!(
+            run_args(&["burnin", "run", "--format", "json"]).format,
+            Format::Json
+        );
+    }
+
+    #[test]
+    fn worker_args_carry_the_run_settings() {
+        let run = run_args(&[
+            "burnin",
+            "run",
+            "-p",
+            "fp64",
+            "-m",
+            "12.5%",
+            "--matrix-size",
+            "4096",
+            "--chunk-secs",
+            "0.75",
+            "--tolerance",
+            "0.001",
+            "--inject-fault",
+        ]);
+        let mut argv = vec![OsString::from("burnin")];
+        argv.extend(run.worker_args(3, 2));
+        let Command::Worker(worker) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("not a worker command");
+        };
+        assert_eq!(worker.ordinal, 3);
+        assert_eq!(worker.host_sharers, 2);
+        assert_eq!(worker.run.precision, run.precision);
+        assert_eq!(worker.run.mem, run.mem);
+        assert_eq!(worker.run.matrix_size, run.matrix_size);
+        assert_eq!(worker.run.chunk_secs, run.chunk_secs);
+        assert_eq!(worker.run.tolerance, run.tolerance);
+        assert!(worker.run.inject_fault);
+    }
+
+    #[test]
+    fn worker_args_keep_exact_memory_sizes() {
+        let run = run_args(&["burnin", "run", "-m", "16G"]);
+        let mut argv = vec![OsString::from("burnin")];
+        argv.extend(run.worker_args(0, 1));
+        let Command::Worker(worker) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("not a worker command");
+        };
+        assert_eq!(worker.run.mem, MemSpec::Bytes(16 << 30));
     }
 
     #[test]

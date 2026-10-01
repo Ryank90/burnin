@@ -1,16 +1,28 @@
-//! GPU telemetry from NVML.
+//! GPU telemetry and hardware errors from NVML.
 //!
 //! Every reading is optional. Some GPUs report fields as not supported; for
 //! example unified-memory parts have no dedicated memory to report.
 
 use std::fmt::Display;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use nvml_wrapper::bitmasks::device::ThrottleReasons;
+use nvml_wrapper::bitmasks::event::EventTypes;
 use nvml_wrapper::enum_wrappers::device::{Clock, EccCounter, MemoryError, TemperatureSensor};
+use nvml_wrapper::enums::event::XidError;
 use nvml_wrapper::error::NvmlError;
+use nvml_wrapper::event::EventSet;
+use nvml_wrapper::struct_wrappers::event::EventData;
 use nvml_wrapper::{Device, Nvml};
 
+use crate::monitor::{HardwareErrors, Monitor, NoMonitor, Reading};
 use crate::units::format_bytes;
+
+/// How long the Xid watcher waits for an event before checking whether to stop.
+const XID_WAIT_MS: u32 = 500;
 
 pub struct Telemetry {
     nvml: Nvml,
@@ -35,46 +47,160 @@ impl Telemetry {
     }
 }
 
-/// A point-in-time reading taken during a run.
-pub struct Sample {
-    pub temperature_c: Option<u32>,
-    pub power_w: Option<f64>,
-    pub sm_clock_mhz: Option<u32>,
-    pub throttle: Option<ThrottleReasons>,
+/// Watches the GPUs at `pci_bus_ids` through NVML while `body` runs. Without
+/// NVML, `body` gets a monitor that reports nothing.
+pub fn watch<R>(
+    telemetry: Option<&Telemetry>,
+    pci_bus_ids: &[String],
+    body: impl FnOnce(&dyn Monitor) -> R,
+) -> R {
+    let Some(telemetry) = telemetry else {
+        return body(&NoMonitor);
+    };
+    let (monitor, events) = NvmlMonitor::new(telemetry, pci_bus_ids);
+    let monitor = &monitor;
+    thread::scope(|scope| {
+        if let Some(events) = events {
+            scope.spawn(move || monitor.watch_xids(events));
+        }
+        let result = body(monitor);
+        monitor.stop.store(true, Ordering::SeqCst);
+        result
+    })
 }
 
-impl Sample {
-    pub fn take(device: &Device) -> Self {
+/// ECC error totals, where the GPU reports them.
+#[derive(Clone, Copy, Default)]
+struct EccCounts {
+    corrected: Option<u64>,
+    uncorrected: Option<u64>,
+}
+
+impl EccCounts {
+    fn read(device: &Device) -> Self {
+        let count = |kind| device.total_ecc_errors(kind, EccCounter::Volatile).ok();
         Self {
-            temperature_c: device.temperature(TemperatureSensor::Gpu).ok(),
-            power_w: device.power_usage().ok().map(milliwatts_to_watts),
-            sm_clock_mhz: device.clock_info(Clock::SM).ok(),
-            throttle: device.current_throttle_reasons().ok(),
+            corrected: count(MemoryError::Corrected),
+            uncorrected: count(MemoryError::Uncorrected),
         }
     }
 }
 
-impl std::fmt::Display for Sample {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.temperature_c {
-            Some(t) => write!(f, "{t:>3} C")?,
-            None => write!(f, " -- C")?,
-        }
-        match self.power_w {
-            Some(w) => write!(f, "  {w:>5.0} W")?,
-            None => write!(f, "     -- W")?,
-        }
-        match self.sm_clock_mhz {
-            Some(mhz) => write!(f, "  {mhz:>4} MHz")?,
-            None => write!(f, "    -- MHz")?,
-        }
-        if let Some(reasons) = self.throttle {
-            let reasons = reasons - ThrottleReasons::GPU_IDLE;
-            if !reasons.is_empty() {
-                write!(f, "  throttled: {}", throttle_names(reasons))?;
+struct NvmlMonitor<'nvml> {
+    devices: Vec<Option<Device<'nvml>>>,
+    pci_bus_ids: Vec<String>,
+    /// ECC totals when the run started, so only new errors are counted.
+    baseline: Vec<EccCounts>,
+    /// Xid codes seen for each GPU, or `None` where they can't be watched.
+    xids: Mutex<Vec<Option<Vec<u64>>>>,
+    stop: AtomicBool,
+}
+
+impl<'nvml> NvmlMonitor<'nvml> {
+    /// Records the starting ECC counts and registers for critical Xid events.
+    /// Returns the event set to watch, if any GPU supports them.
+    fn new(telemetry: &'nvml Telemetry, pci_bus_ids: &[String]) -> (Self, Option<EventSet<'nvml>>) {
+        let devices: Vec<_> = pci_bus_ids.iter().map(|id| telemetry.device(id)).collect();
+        let baseline = devices
+            .iter()
+            .map(|device| device.as_ref().map(EccCounts::read).unwrap_or_default())
+            .collect();
+
+        let mut xids = vec![None; devices.len()];
+        let mut set = telemetry.nvml.create_event_set().ok();
+        for (index, device) in devices.iter().enumerate() {
+            let (Some(device), Some(unregistered)) = (device, set.take()) else {
+                continue;
+            };
+            match device.register_events(EventTypes::CRITICAL_XID_ERROR, unregistered) {
+                Ok(registered) => {
+                    set = Some(registered);
+                    xids[index] = Some(Vec::new());
+                }
+                // A failed registration frees the set, so start a new one.
+                Err(_) => set = telemetry.nvml.create_event_set().ok(),
             }
         }
-        Ok(())
+        let watching = xids.iter().any(Option::is_some);
+        let monitor = Self {
+            devices,
+            pci_bus_ids: pci_bus_ids.to_vec(),
+            baseline,
+            xids: Mutex::new(xids),
+            stop: AtomicBool::new(false),
+        };
+        (monitor, set.filter(|_| watching))
+    }
+
+    fn watch_xids(&self, events: EventSet<'nvml>) {
+        while !self.stop.load(Ordering::SeqCst) {
+            match events.wait(XID_WAIT_MS) {
+                Ok(event) => self.record(&event),
+                Err(NvmlError::Timeout) => {}
+                // Don't spin if waiting keeps failing.
+                Err(_) => thread::sleep(Duration::from_millis(u64::from(XID_WAIT_MS))),
+            }
+        }
+    }
+
+    fn record(&self, event: &EventData) {
+        let xid = match event.event_data {
+            Some(XidError::Value(xid)) => xid,
+            // Still a critical error, just without a code.
+            Some(XidError::Unknown) | None => 0,
+        };
+        let Ok(bus_id) = event.device.pci_info().map(|info| info.bus_id) else {
+            return;
+        };
+        let Some(index) = self
+            .pci_bus_ids
+            .iter()
+            .position(|id| id.eq_ignore_ascii_case(&bus_id))
+        else {
+            return;
+        };
+        let mut xids = self
+            .xids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(seen) = xids[index].as_mut() {
+            seen.push(xid);
+        }
+    }
+}
+
+impl Monitor for NvmlMonitor<'_> {
+    fn reading(&self, gpu: usize) -> Option<Reading> {
+        let device = self.devices[gpu].as_ref()?;
+        Some(Reading {
+            temperature_c: device.temperature(TemperatureSensor::Gpu).ok(),
+            power_w: device.power_usage().ok().map(milliwatts_to_watts),
+            sm_clock_mhz: device.clock_info(Clock::SM).ok(),
+            throttle: device
+                .current_throttle_reasons()
+                .map(|reasons| throttle_list(reasons - ThrottleReasons::GPU_IDLE))
+                .unwrap_or_default(),
+        })
+    }
+
+    fn errors(&self, gpu: usize) -> HardwareErrors {
+        let now = self.devices[gpu]
+            .as_ref()
+            .map(EccCounts::read)
+            .unwrap_or_default();
+        let base = self.baseline[gpu];
+        let new = |now: Option<u64>, base: Option<u64>| {
+            now.zip(base).map(|(now, base)| now.saturating_sub(base))
+        };
+        let xids = self
+            .xids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        HardwareErrors {
+            ecc_corrected: new(now.corrected, base.corrected),
+            ecc_uncorrected: new(now.uncorrected, base.uncorrected),
+            xids: xids[gpu].clone(),
+        }
     }
 }
 
@@ -82,15 +208,18 @@ fn milliwatts_to_watts(milliwatts: u32) -> f64 {
     f64::from(milliwatts) / 1000.0
 }
 
+fn throttle_list(reasons: ThrottleReasons) -> Vec<String> {
+    reasons
+        .iter_names()
+        .map(|(name, _)| name.to_ascii_lowercase().replace('_', "-"))
+        .collect()
+}
+
 fn throttle_names(reasons: ThrottleReasons) -> String {
     if reasons.is_empty() {
         return "none".to_string();
     }
-    reasons
-        .iter_names()
-        .map(|(name, _)| name.to_ascii_lowercase().replace('_', "-"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    throttle_list(reasons).join(", ")
 }
 
 /// Prints every field burnin reads, including the ones this GPU does not support.
@@ -168,5 +297,15 @@ pub fn print_probe(device: &Device) {
     show(
         "ecc uncorrected",
         device.total_ecc_errors(MemoryError::Uncorrected, EccCounter::Volatile),
+    );
+    show(
+        "xid events",
+        device.supported_event_types().map(|types| {
+            if types.contains(EventTypes::CRITICAL_XID_ERROR) {
+                "supported"
+            } else {
+                "not supported"
+            }
+        }),
     );
 }

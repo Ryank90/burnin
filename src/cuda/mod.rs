@@ -3,6 +3,7 @@
 mod burn;
 mod fp8;
 
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -12,10 +13,11 @@ use cudarc::driver::sys::{CUdevice, CUdevice_attribute as Attr};
 use cudarc::driver::{CudaContext, result as driver};
 
 use crate::mem::{self, HostMemory, MemSpec};
+use crate::output::{Output, Record};
 use crate::supervisor::{self, Config, Target, Work};
-use crate::telemetry::{Sample, Telemetry};
+use crate::telemetry::{self, Telemetry};
 use crate::units::format_bytes;
-use crate::{Precision, RunArgs};
+use crate::{Isolation, Precision, RunArgs, WorkerArgs, isolation};
 
 /// Longest wait for every GPU to finish setting up before the clock starts anyway.
 const MAX_SETUP: Duration = Duration::from_secs(120);
@@ -23,6 +25,8 @@ const MAX_SETUP: Duration = Duration::from_secs(120);
 const MIN_STALL: Duration = Duration::from_secs(60);
 /// Shortest wait for GPUs to finish their current chunk once the run ends.
 const MIN_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// Longest wait for a GPU's process to exit after it has been given up on and killed.
+const REAP_GRACE: Duration = Duration::from_secs(5);
 
 /// Fails with a readable message when a CUDA library is missing, instead of
 /// the panic cudarc raises on first use.
@@ -297,25 +301,26 @@ pub fn run(args: &RunArgs) -> Result<u8> {
         .into_iter()
         .map(DeviceInfo::query)
         .collect::<Result<Vec<_>>>()?;
-    let ptx = burn::compile_kernels()?;
+    // Worker processes compile their own kernels; threads share one copy.
+    let ptx = match args.isolation {
+        Isolation::Thread => Some(burn::compile_kernels()?),
+        Isolation::Process => None,
+    };
     let host_sharers = infos.iter().filter(|info| info.integrated).count() as u64;
 
-    // Telemetry is read on the supervisor thread, matched to each GPU by PCI address.
+    // Telemetry is read in this process, matched to each GPU by PCI address.
     let telemetry = Telemetry::init().ok();
-    let nvml: Vec<_> = infos
-        .iter()
-        .map(|info| telemetry.as_ref().and_then(|t| t.device(&info.pci_bus_id)))
-        .collect();
+    let pci_bus_ids: Vec<String> = infos.iter().map(|info| info.pci_bus_id.clone()).collect();
 
     let stop = Arc::new(AtomicBool::new(false));
     install_stop_handler(stop.clone())?;
 
-    println!(
-        "testing {} {} with {}; Ctrl-C stops early",
-        infos.len(),
-        if infos.len() == 1 { "GPU" } else { "GPUs" },
-        args.precision.name()
-    );
+    let mut out = Output::new(args.format, std::io::stdout().lock());
+    out.emit(Record::Start {
+        version: env!("CARGO_PKG_VERSION"),
+        precision: args.precision.name(),
+        gpus: infos.len(),
+    });
     let workers = infos
         .into_iter()
         .map(|info| {
@@ -324,10 +329,18 @@ pub fn run(args: &RunArgs) -> Result<u8> {
                 name: info.name.clone(),
                 detail: info.summary(),
             };
-            let (ptx, args, stop) = (ptx.clone(), args.clone(), stop.clone());
-            let work: Work = Box::new(move |reporter| {
-                burn::worker(&info, ptx, &args, host_sharers, reporter, &stop)
-            });
+            let work: Work = match &ptx {
+                Some(ptx) => {
+                    let (ptx, args, stop) = (ptx.clone(), args.clone(), stop.clone());
+                    Box::new(move |reporter| {
+                        burn::worker(&info, ptx, &args, host_sharers, reporter, &stop)
+                    })
+                }
+                None => isolation::child_work(
+                    args.worker_args(info.ordinal, host_sharers),
+                    stop.clone(),
+                ),
+            };
             (target, work)
         })
         .collect();
@@ -337,21 +350,33 @@ pub fn run(args: &RunArgs) -> Result<u8> {
         report_every: args.report_every,
         max_setup: MAX_SETUP,
         min_stall: MIN_STALL,
+        min_hang: args.hang_timeout,
         min_shutdown_grace: MIN_SHUTDOWN_GRACE,
+        reap_grace: REAP_GRACE,
     };
-    let sample = |index: usize| {
-        nvml[index]
-            .as_ref()
-            .map(|device| Sample::take(device).to_string())
-    };
-    let summary = supervisor::supervise(
-        workers,
-        &config,
-        stop,
-        sample,
-        &mut std::io::stdout().lock(),
-    );
+    let summary = telemetry::watch(telemetry.as_ref(), &pci_bus_ids, |monitor| {
+        supervisor::supervise(workers, &config, stop, monitor, &mut out)
+    });
     Ok(summary.exit_status())
+}
+
+/// Tests one GPU as a child process of `burnin run`; see [`crate::isolation`].
+pub fn serve_worker(args: &WorkerArgs) -> ExitCode {
+    let setup = || -> Result<(DeviceInfo, cudarc::nvrtc::Ptx)> {
+        let fp8 = args.run.precision == Precision::Fp8;
+        require_libraries(true, fp8, true)?;
+        device_count()?;
+        Ok((DeviceInfo::query(args.ordinal)?, burn::compile_kernels()?))
+    };
+    isolation::serve(|stop| -> Work {
+        let (run, host_sharers) = (args.run.clone(), args.host_sharers);
+        match setup() {
+            Ok((info, ptx)) => Box::new(move |reporter| {
+                burn::worker(&info, ptx, &run, host_sharers, reporter, &stop)
+            }),
+            Err(err) => Box::new(move |_| Err(err)),
+        }
+    })
 }
 
 /// The first Ctrl-C (or SIGTERM) lets every GPU finish its current chunk and

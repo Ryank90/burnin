@@ -13,14 +13,18 @@ GPU burn-in and stress testing. burnin keeps every GPU in a machine busy with la
 
 Chunks are sized to take about 1.5 seconds each. That keeps progress lines, Ctrl-C and error reports prompt on both slow and fast GPUs.
 
-Every GPU is tested at the same time, each by its own worker thread. A supervisor prints each GPU's progress and warns when a GPU stops making progress. When the run ends it gives each GPU its own verdict:
+Every GPU is tested at the same time, each in its own child process. A supervisor prints each GPU's progress and warns when a GPU goes quiet. If a GPU makes no progress for `--hang-timeout` (3 minutes by default), the supervisor gives up on it and kills its process, and the other GPUs carry on. When the run ends, each GPU gets its own verdict:
 
 | Verdict | Meaning |
 |---|---|
 | `PASS` | Every result matched. |
-| `FAIL` | Some results differed, or the GPU hit an error during the run. |
-| `HUNG` | The GPU didn't finish its last chunk within the grace period after the run ended. |
+| `FAIL` | Some results differed, the GPU hit an error during the run, or it reported uncorrected ECC memory errors or a critical driver error (Xid). |
+| `HUNG` | The GPU stopped making progress, or didn't finish its last chunk within the grace period after the run ended. |
 | `ERROR` | The GPU couldn't be set up, so it wasn't tested. |
+
+Progress lines show each GPU's temperature, power, SM clock and any throttling. The summary adds the peak temperature, average and peak power, average and lowest clock, and every throttle reason seen. It also lists ECC memory errors and critical driver errors (Xid events) that occurred during the run. Corrected ECC errors are reported but don't fail a GPU. Fields a GPU doesn't report are left out; `burnin probe` shows which ones a GPU supports.
+
+`--isolation thread` tests every GPU in threads of a single process instead. That's easier to debug, but a hung GPU can only be reported, not stopped.
 
 ## Requirements
 
@@ -29,6 +33,18 @@ Every GPU is tested at the same time, each by its own worker thread. A superviso
 - The CUDA 13 libraries cuBLAS and NVRTC, plus cuBLASLt for `fp8`. CUDA 12 may work but hasn't been tested yet.
 
 The build itself doesn't need the CUDA toolkit: burnin loads the CUDA libraries when it starts.
+
+## Install
+
+Prebuilt Linux binaries for x86_64 and aarch64 are attached to each [GitHub release](https://github.com/Ryank90/burnin/releases). They run on any distribution with glibc 2.28 or newer.
+
+```sh
+target="$(uname -m)-unknown-linux-gnu"
+curl -fsSL "https://github.com/Ryank90/burnin/releases/latest/download/burnin-$target.tar.gz" | tar -xz
+./burnin-$target/burnin --version
+```
+
+Each archive has a matching `.sha256` file for checking the download.
 
 ## Build
 
@@ -71,16 +87,34 @@ Exit status:
 - `1` when any GPU failed or hung.
 - `2` when a GPU couldn't be tested, or burnin itself hit an error.
 
+### JSON output
+
+`burnin run --format json` writes [JSON Lines](https://jsonlines.org) to stdout, one object per event, instead of text. Each object has an `event` field:
+
+| Event | When |
+|---|---|
+| `start` | The run begins: burnin version, precision and GPU count. |
+| `gpu` | Once for each GPU to be tested. |
+| `ready` | A GPU is set up and testing has begun. |
+| `running` | Every GPU is ready and the clock has started. |
+| `progress` | Every `--report-every`: pass, throughput, mismatches and telemetry for each GPU. |
+| `mismatch`, `hardware`, `stalled`, `recovered`, `hung`, `error` | As they happen. |
+| `summary` | Always last: the overall `result` and `exit_status`, and each GPU's verdict, throughput, telemetry and hardware errors. |
+
+To act only on the outcome, read the last line:
+
+```sh
+burnin run 10m --format json | tail -n 1 | jq '.gpus[] | {gpu, verdict, detail}'
+```
+
+Errors that stop burnin before testing starts still go to stderr as text, with exit status 2.
+
 ### Unified-memory GPUs
 
 On GPUs that share system RAM with the CPU, such as the GB10 in DGX Spark, CUDA's figure for free memory leaves out reclaimable page cache. burnin sizes its memory from the system's available memory instead, and leaves a reserve for the OS. If several such GPUs are tested at once, they split that memory between them. `burnin probe` shows both figures and the budget it would use.
 
 ## Roadmap
 
-- Each GPU in its own process, so a hung GPU can be killed while the others carry on. Today a hung GPU is reported and left behind when burnin exits.
-- Telemetry in the summary, plus ECC error counts and driver error events. Progress lines already show temperature, power, clock and throttling.
-- JSON output for automation.
-- Prebuilt x86_64 and aarch64 release binaries.
 - An Apple Silicon backend using Metal.
 
 ## Contributing
@@ -95,6 +129,8 @@ cargo check --target aarch64-unknown-linux-gnu
 ```
 
 GPU runs need a Linux machine with an NVIDIA GPU. When you report a problem, please include the output of `burnin probe`.
+
+To publish a release, set the new version in `Cargo.toml`, merge it, then push a matching tag such as `v0.2.0`. The release workflow builds and checks both Linux binaries, then publishes them to a GitHub release with generated notes.
 
 ## License
 
