@@ -97,16 +97,50 @@ pub struct RunArgs {
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
+    /// Single precision.
     Fp32,
+    /// FP32 inputs and results, multiplied on TF32 tensor cores. Needs compute capability 8.0 or newer.
+    Tf32,
+    /// Half precision on tensor cores. Needs compute capability 7.0 or newer.
+    Fp16,
+    /// Bfloat16 on tensor cores. Needs compute capability 8.0 or newer.
+    Bf16,
+    /// Double precision.
     Fp64,
+    /// FP8 (E4M3) inputs with FP32 results, on tensor cores. Needs compute capability 8.9 or newer.
+    Fp8,
 }
 
 impl Precision {
     pub fn name(self) -> &'static str {
         match self {
             Self::Fp32 => "fp32",
+            Self::Tf32 => "tf32",
+            Self::Fp16 => "fp16",
+            Self::Bf16 => "bf16",
             Self::Fp64 => "fp64",
+            Self::Fp8 => "fp8",
         }
+    }
+
+    /// Checks that a GPU with this compute capability has tensor cores for
+    /// this precision. FP32 and FP64 run on every GPU.
+    pub fn check_support(self, (major, minor): (i32, i32)) -> Result<(), String> {
+        let needed = match self {
+            Self::Fp32 | Self::Fp64 => return Ok(()),
+            Self::Fp16 => (7, 0),
+            Self::Tf32 | Self::Bf16 => (8, 0),
+            Self::Fp8 => (8, 9),
+        };
+        if (major, minor) < needed {
+            return Err(format!(
+                "{} needs compute capability {}.{} or newer, but this GPU has {major}.{minor}",
+                self.name(),
+                needed.0,
+                needed.1
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -197,8 +231,64 @@ mod tests {
     }
 
     #[test]
+    fn parses_every_precision() {
+        for precision in Precision::value_variants() {
+            let parsed = run_args(&["burnin", "run", "-p", precision.name()]).precision;
+            assert_eq!(parsed, *precision);
+        }
+        assert_eq!(
+            run_args(&["burnin", "run", "--precision", "bf16"]).precision,
+            Precision::Bf16
+        );
+        assert_eq!(
+            run_args(&["burnin", "run", "-p", "tf32"]).precision,
+            Precision::Tf32
+        );
+    }
+
+    #[test]
     fn rejects_unknown_precision() {
         assert!(Cli::try_parse_from(["burnin", "run", "-p", "fp128"]).is_err());
+        assert!(Cli::try_parse_from(["burnin", "run", "-p", "fp4"]).is_err());
+    }
+
+    #[test]
+    fn fp32_and_fp64_run_anywhere() {
+        for precision in [Precision::Fp32, Precision::Fp64] {
+            assert_eq!(precision.check_support((5, 2)), Ok(()));
+        }
+    }
+
+    #[test]
+    fn tensor_core_precisions_need_new_enough_gpus() {
+        let cases = [
+            (Precision::Fp16, (6, 1), false),
+            (Precision::Fp16, (7, 0), true),
+            (Precision::Tf32, (7, 5), false),
+            (Precision::Tf32, (8, 0), true),
+            (Precision::Bf16, (7, 5), false),
+            (Precision::Bf16, (8, 6), true),
+            (Precision::Fp8, (8, 6), false),
+            (Precision::Fp8, (8, 9), true),
+            (Precision::Fp8, (9, 0), true),
+            (Precision::Fp8, (12, 0), true),
+        ];
+        for (precision, capability, supported) in cases {
+            assert_eq!(
+                precision.check_support(capability).is_ok(),
+                supported,
+                "{} on {capability:?}",
+                precision.name()
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_precision_explains_why() {
+        assert_eq!(
+            Precision::Fp8.check_support((8, 0)),
+            Err("fp8 needs compute capability 8.9 or newer, but this GPU has 8.0".to_string())
+        );
     }
 
     #[test]

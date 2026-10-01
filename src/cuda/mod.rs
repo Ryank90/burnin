@@ -1,6 +1,7 @@
 //! CUDA backend: device discovery, probing and running the stress test.
 
 mod burn;
+mod fp8;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -10,11 +11,11 @@ use anyhow::{Context, Result, bail};
 use cudarc::driver::sys::{CUdevice, CUdevice_attribute as Attr};
 use cudarc::driver::{CudaContext, result as driver};
 
-use crate::RunArgs;
 use crate::mem::{self, HostMemory, MemSpec};
 use crate::supervisor::{self, Config, Target, Work};
 use crate::telemetry::{Sample, Telemetry};
 use crate::units::format_bytes;
+use crate::{Precision, RunArgs};
 
 /// Longest wait for every GPU to finish setting up before the clock starts anyway.
 const MAX_SETUP: Duration = Duration::from_secs(120);
@@ -25,12 +26,13 @@ const MIN_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// Fails with a readable message when a CUDA library is missing, instead of
 /// the panic cudarc raises on first use.
-fn require_libraries(blas: bool, nvrtc: bool) -> Result<()> {
+fn require_libraries(blas: bool, blas_lt: bool, nvrtc: bool) -> Result<()> {
     // SAFETY: these only try to load the shared libraries.
-    let (driver_found, blas_found, nvrtc_found) = unsafe {
+    let (driver_found, blas_found, blas_lt_found, nvrtc_found) = unsafe {
         (
             cudarc::driver::sys::is_culib_present(),
             !blas || cudarc::cublas::sys::is_culib_present(),
+            !blas_lt || cudarc::cublaslt::sys::is_culib_present(),
             !nvrtc || cudarc::nvrtc::sys::is_culib_present(),
         )
     };
@@ -42,6 +44,11 @@ fn require_libraries(blas: bool, nvrtc: bool) -> Result<()> {
     if !blas_found {
         bail!(
             "cuBLAS (libcublas.so) was not found; install the CUDA libraries or add them to LD_LIBRARY_PATH"
+        );
+    }
+    if !blas_lt_found {
+        bail!(
+            "cuBLASLt (libcublasLt.so) was not found; install the CUDA libraries or add them to LD_LIBRARY_PATH"
         );
     }
     if !nvrtc_found {
@@ -125,7 +132,7 @@ fn raw_device(ordinal: usize) -> Result<CUdevice> {
 }
 
 pub fn list() -> Result<()> {
-    require_libraries(false, false)?;
+    require_libraries(false, false, false)?;
     let count = device_count()?;
     if count == 0 {
         println!("no CUDA devices found");
@@ -155,6 +162,7 @@ pub fn probe(only: Option<usize>) -> Result<()> {
         [
             ("libcuda", cudarc::driver::sys::is_culib_present()),
             ("libcublas", cudarc::cublas::sys::is_culib_present()),
+            ("libcublasLt", cudarc::cublaslt::sys::is_culib_present()),
             ("libnvrtc", cudarc::nvrtc::sys::is_culib_present()),
         ]
     };
@@ -167,7 +175,7 @@ pub fn probe(only: Option<usize>) -> Result<()> {
         Ok(_) => println!("  {:<18}found", "libnvidia-ml"),
         Err(err) => println!("  {:<18}unavailable ({err})", "libnvidia-ml"),
     }
-    require_libraries(false, false)?;
+    require_libraries(false, false, false)?;
 
     let host = HostMemory::read().ok();
     if let Some(host) = host {
@@ -247,8 +255,8 @@ pub fn probe(only: Option<usize>) -> Result<()> {
             "default budget",
             format_bytes(budget.bytes),
             mem::describe(spec, &budget),
-            mem::result_slots(budget.bytes, square * 4),
-            mem::result_slots(budget.bytes, square * 8),
+            mem::result_slots(budget.bytes, square * 4, square * 4),
+            mem::result_slots(budget.bytes, square * 8, square * 8),
         );
 
         match &telemetry {
@@ -264,9 +272,14 @@ pub fn probe(only: Option<usize>) -> Result<()> {
 
 /// Tests the selected GPUs in parallel and returns the process exit status.
 pub fn run(args: &RunArgs) -> Result<u8> {
-    require_libraries(true, true)?;
+    let fp8 = args.precision == Precision::Fp8;
+    require_libraries(true, fp8, true)?;
     if args.matrix_size == 0 || args.matrix_size > i32::MAX as usize {
         bail!("matrix size must be between 1 and {}", i32::MAX);
+    }
+    // cuBLASLt's FP8 kernels need every column to start on a 16-byte boundary.
+    if fp8 && args.matrix_size % 16 != 0 {
+        bail!("fp8 needs a matrix size that is a multiple of 16");
     }
     if args.chunk_secs.is_nan() || args.chunk_secs <= 0.0 {
         bail!("chunk length must be greater than zero");

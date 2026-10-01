@@ -26,7 +26,7 @@ Every GPU is tested at the same time, each by its own worker thread. A superviso
 
 - Linux on x86_64 or aarch64.
 - An NVIDIA GPU and driver.
-- The CUDA 13 libraries cuBLAS and NVRTC. CUDA 12 may work but hasn't been tested yet.
+- The CUDA 13 libraries cuBLAS and NVRTC, plus cuBLASLt for `fp8`. CUDA 12 may work but hasn't been tested yet.
 
 The build itself doesn't need the CUDA toolkit: burnin loads the CUDA libraries when it starts.
 
@@ -45,12 +45,26 @@ burnin list                     # GPUs burnin can see
 burnin probe                    # device, memory and telemetry details
 burnin run 10m                  # stress every GPU for ten minutes
 burnin run 1h -d 1 -p fp64      # GPU 1 only, double precision, one hour
+burnin run 30m -p bf16          # bfloat16 on the tensor cores
 burnin run 30m -d 0,2           # GPUs 0 and 2
 burnin run 30m -m 50%           # use half of the usable memory
 burnin run 30s --inject-fault   # corrupt one result on purpose to check detection
 ```
 
 Durations accept seconds, or units such as `90s`, `10m` and `2h`. Memory accepts a percentage such as `90%`, or a size such as `16G`, `512M` or `4096` (MiB when there's no unit).
+
+`-p` picks the precision of the matrix multiplies. The lower precisions run on the tensor cores, so each needs a GPU with a new enough compute capability. A GPU that's too old for the chosen precision isn't tested, and is reported as `ERROR`.
+
+| Precision | Inputs | Results | Needs |
+|---|---|---|---|
+| `fp32` (default) | FP32 | FP32 | Any GPU |
+| `tf32` | FP32, multiplied as TF32 | FP32 | Compute capability 8.0 (Ampere) or newer |
+| `fp16` | FP16 | FP16 | Compute capability 7.0 (Volta) or newer |
+| `bf16` | BF16 | BF16 | Compute capability 8.0 (Ampere) or newer |
+| `fp64` | FP64 | FP64 | Any GPU |
+| `fp8` | FP8 E4M3 | FP32 | Compute capability 8.9 (Ada) or newer, and a matrix size that's a multiple of 16 |
+
+`fp16`, `bf16` and `fp8` accumulate in FP32. `burnin list` shows each GPU's compute capability, for example `sm_89` for 8.9.
 
 Exit status:
 - `0` when every GPU passed.
@@ -64,7 +78,6 @@ On GPUs that share system RAM with the CPU, such as the GB10 in DGX Spark, CUDA'
 ## Roadmap
 
 - Each GPU in its own process, so a hung GPU can be killed while the others carry on. Today a hung GPU is reported and left behind when burnin exits.
-- More precisions: TF32, FP16, BF16 and FP8.
 - Telemetry in the summary, plus ECC error counts and driver error events. Progress lines already show temperature, power, clock and throttling.
 - JSON output for automation.
 - Prebuilt x86_64 and aarch64 release binaries.
