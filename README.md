@@ -147,9 +147,3 @@ cargo check --target aarch64-unknown-linux-gnu
 `cargo test` doesn't use the GPU. GPU runs need a Linux machine with an NVIDIA GPU, or a Mac with Apple silicon. When you report a problem, please include the output of `burnin probe`.
 
 To publish a release, set the new version in `Cargo.toml`, merge it, then push a matching tag such as `v0.2.0`. The release workflow builds and checks both Linux binaries, then publishes them to a GitHub release with generated notes.
-
-## License
-
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
