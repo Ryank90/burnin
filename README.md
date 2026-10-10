@@ -1,4 +1,4 @@
-# burnin
+# GPU & multi-GPU burn-in and stress testing
 
 GPU burn-in and stress testing. burnin keeps every GPU in a machine busy with large matrix multiplies and checks that every result is correct, so you can find faulty hardware before it goes into service.
 
